@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment: {POSTGRES_DB: ${POSTGRES_DB:-trading_platform}, POSTGRES_USER: ${POSTGRES_USER:-trading_platform}, POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trading_platform} -d ${POSTGRES_DB:-trading_platform}"], interval: 10s, timeout: 5s, retries: 5}
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes: [redis_data:/data]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 10s, timeout: 3s, retries: 5}
+    restart: unless-stopped
+  backend:
+    build: {context: ., dockerfile: docker/backend.Dockerfile}
+    env_file: .env
+    volumes: [./media:/app/media, ./static:/app/static, ./logs:/app/logs]
+    depends_on: {db: {condition: service_healthy}, redis: {condition: service_healthy}}
+    command: ["/app/scripts/start-backend.sh"]
+    ports: ["8000:8000"]
+    restart: unless-stopped
+  worker:
+    build: {context: ., dockerfile: docker/backend.Dockerfile}
+    env_file: .env
+    volumes: [./logs:/app/logs]
+    depends_on: [backend]
+    command: celery -A backend.config worker -l INFO --concurrency=4
+    restart: unless-stopped
+  beat:
+    build: {context: ., dockerfile: docker/backend.Dockerfile}
+    env_file: .env
+    volumes: [./logs:/app/logs]
+    depends_on: [backend]
+    command: celery -A backend.config beat -l INFO
+    restart: unless-stopped
+  frontend:
+    build: {context: ., dockerfile: docker/frontend.Dockerfile}
+    env_file: .env
+    depends_on: [backend]
+    ports: ["3000:3000"]
+    restart: unless-stopped
+  nginx:
+    image: nginx:1.27-alpine
+    volumes: [./deployment/nginx.conf:/etc/nginx/nginx.conf:ro, ./static:/app/static:ro, ./media:/app/media:ro]
+    depends_on: [backend, frontend]
+    ports: ["80:80"]
+    restart: unless-stopped
+volumes: {postgres_data: {}, redis_data: {}}

@@ -1,0 +1,17 @@
+# Pristine Production Gitignore
+.env
+.env.txt
+node_modules/
+frontend/node_modules/
+frontend/.next/
+__pycache__/
+backend/__pycache__/
+broker_engine/__pycache__/
+trading_engine/__pycache__/
+intelligence/__pycache__/
+db.sqlite3
+db.sqlite3-journal
+logs/
+backend/logs/
+*.log
+.venv/

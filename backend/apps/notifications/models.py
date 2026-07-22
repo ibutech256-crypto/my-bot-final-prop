@@ -1,0 +1,5 @@
+from django.conf import settings
+from django.db import models
+from backend.apps.common.models import BaseModel
+class Notification(BaseModel): user=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.CASCADE,related_name="notifications"); channel=models.CharField(max_length=32,default="IN_APP",db_index=True); title=models.CharField(max_length=160); body=models.TextField(); payload=models.JSONField(default=dict); read_at=models.DateTimeField(null=True,blank=True); severity=models.CharField(max_length=16,default="INFO",db_index=True)
+class TelegramSubscriber(BaseModel): user=models.OneToOneField(settings.AUTH_USER_MODEL,on_delete=models.CASCADE,related_name="telegram_subscriber"); chat_id=models.CharField(max_length=64,unique=True); username=models.CharField(max_length=120,blank=True); verified=models.BooleanField(default=False,db_index=True); signal_alerts=models.BooleanField(default=True); trade_alerts=models.BooleanField(default=True); error_alerts=models.BooleanField(default=True); subscription_alerts=models.BooleanField(default=True)
