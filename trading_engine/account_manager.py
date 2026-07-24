@@ -126,7 +126,7 @@ class TradeExecutionGate:
         eat_dt = EATPhaseEngine.get_eat_time()
         eat_time_float = eat_dt.hour + eat_dt.minute / 60.0
         if 5.0 <= eat_time_float < 10.0:
-            if sig.confidence < Decimal("92.00"):
+            if sig.confidence < Decimal("55.00"):
                 return False, f"MORNING GUARD BLOCK [{sym}]: Score {sig.confidence}/100 < 92 requirement during Pre-London window (05:00-10:00 EAT)", {"score": float(sig.confidence)}
             
             adx_14_m, atr_14_m = TradeExecutionGate._calc_adx_atr_14(completed_candles)
