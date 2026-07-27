@@ -12,12 +12,16 @@ INSTALLED_APPS=["daphne","django.contrib.admin","django.contrib.auth","django.co
 MIDDLEWARE=["django.middleware.security.SecurityMiddleware","corsheaders.middleware.CorsMiddleware","django.contrib.sessions.middleware.SessionMiddleware","django.middleware.common.CommonMiddleware","django.middleware.csrf.CsrfViewMiddleware","django.contrib.auth.middleware.AuthenticationMiddleware","django.contrib.messages.middleware.MessageMiddleware","django.middleware.clickjacking.XFrameOptionsMiddleware"]
 ROOT_URLCONF="backend.config.urls"; ASGI_APPLICATION="backend.config.asgi.application"; WSGI_APPLICATION="backend.config.wsgi.application"; AUTH_USER_MODEL="accounts.User"
 TEMPLATES=[{"BACKEND":"django.template.backends.django.DjangoTemplates","DIRS":[],"APP_DIRS":True,"OPTIONS":{"context_processors":["django.template.context_processors.request","django.contrib.auth.context_processors.auth","django.contrib.messages.context_processors.messages"]}}]
-db_engine = os.getenv("DB_ENGINE", "django.db.backends.postgresql")
+db_engine = os.getenv("DB_ENGINE", "django.db.backends.sqlite3")
 if "sqlite" in db_engine:
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": ROOT_DIR / os.getenv("POSTGRES_DB", "db.sqlite3"),
+            "OPTIONS": {
+                "timeout": 30,
+                "init_command": "PRAGMA journal_mode=WAL;",
+            }
         }
     }
 else:
@@ -33,7 +37,7 @@ else:
         }
     }
 REDIS_URL=os.getenv("REDIS_URL","redis://localhost:6379/0")
-CHANNEL_LAYERS={"default":{"BACKEND":"channels_redis.core.RedisChannelLayer","CONFIG":{"hosts":[REDIS_URL]}}}
+CHANNEL_LAYERS={"default":{"BACKEND":"channels_redis.pubsub.RedisPubSubChannelLayer","CONFIG":{"hosts":[{"address":REDIS_URL,"health_check_interval":30,"socket_keepalive":True,"socket_connect_timeout":10}],"prefix":"tradingws"}}}
 CELERY_BROKER_URL=os.getenv("CELERY_BROKER_URL",REDIS_URL); CELERY_RESULT_BACKEND=os.getenv("CELERY_RESULT_BACKEND",REDIS_URL)
 REST_FRAMEWORK={"DEFAULT_AUTHENTICATION_CLASSES":("rest_framework_simplejwt.authentication.JWTAuthentication",),"DEFAULT_PERMISSION_CLASSES":("rest_framework.permissions.IsAuthenticated",),"DEFAULT_SCHEMA_CLASS":"drf_spectacular.openapi.AutoSchema","DEFAULT_FILTER_BACKENDS":("django_filters.rest_framework.DjangoFilterBackend","rest_framework.filters.SearchFilter","rest_framework.filters.OrderingFilter"),"DEFAULT_THROTTLE_CLASSES":["rest_framework.throttling.UserRateThrottle","rest_framework.throttling.AnonRateThrottle"],"DEFAULT_THROTTLE_RATES":{"user":"120/min","anon":"20/min"}}
 SIMPLE_JWT={"ACCESS_TOKEN_LIFETIME":timedelta(minutes=15),"REFRESH_TOKEN_LIFETIME":timedelta(days=7),"ROTATE_REFRESH_TOKENS":True,"AUTH_HEADER_TYPES":("Bearer",)}

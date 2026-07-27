@@ -15,7 +15,9 @@ class BrokerOrderRequest:
     stop_loss: Decimal | None
     take_profit: Decimal | None
     deviation: int = 20
-    order_type: str = "MARKET"  # MARKET, LIMIT
+    order_type: str = "MARKET"
+    expiration: int | None = None
+    is_pit_open: bool | None = None
 
 
 class MT5Client:
@@ -153,7 +155,8 @@ class MT5Client:
             "tp": float(req.take_profit or 0),
             "deviation": req.deviation,
             "type_filling": self.mt5.ORDER_FILLING_IOC,
-            "type_time": self.mt5.ORDER_TIME_GTC,
+            "type_time": (self.mt5.ORDER_TIME_SPECIFIED if req.expiration else self.mt5.ORDER_TIME_GTC),
+            **({"expiration": int(req.expiration)} if req.expiration else {}),
         })
         if result is None:
             raise RuntimeError(f"MT5 order_send failed: {self.mt5.last_error()}")
@@ -165,6 +168,17 @@ class MT5Client:
             f"ticket={result_dict.get('order', 'N/A')}"
         )
         return result_dict
+
+    def place_order(self, req: BrokerOrderRequest) -> dict:
+        """Route to the correct MT5 call based on req.order_type.
+
+        Previously the engine always called place_market_order() even when it had
+        explicitly built a LIMIT request (with retracement price + expiry), so the
+        CRT Sniper Limit entry silently degraded into a market fill at the ask.
+        """
+        if (req.order_type or "MARKET").upper() == "LIMIT":
+            return self.place_limit_order(req)
+        return self.place_market_order(req)
 
     def modify_position(self, ticket: int, sl: float | None = None, tp: float | None = None) -> dict:
         """Modify an existing position's SL/TP."""

@@ -47,6 +47,11 @@ class Command(BaseCommand):
     help = "Run the real-time MT5 Institutional Trading & Telemetry Engine (Romeo TPT)"
 
     def handle(self, *args, **options):
+        import signal
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except Exception:
+            pass
         _auto_load_env()
         self.stdout.write("Starting MT5 Real-Time Institutional Trading & Telemetry Engine...")
 
@@ -470,6 +475,12 @@ class Command(BaseCommand):
                                                 atr = sum(tr_list[-14:]) / Decimal("14")
 
                                             # Spread Protection Gates & Spread-to-Target Ratio (v1.9.2)
+                                            # FIX: mt5_spec was referenced here but only assigned ~124 lines later
+                                            # inside the execution branch, so every evaluation raised
+                                            # UnboundLocalError and no signal ever reached scoring.
+                                            mt5_spec = client.mt5.symbol_info(sym)
+                                            if not mt5_spec:
+                                                continue
                                             point = Decimal(str(mt5_spec.point if mt5_spec.point else "0.00001"))
                                             raw_spread = Decimal(str(mt5_spec.spread if mt5_spec.spread else "5")) * point
                                             pip_size = point * Decimal("10") if mt5_spec.digits in [3, 5] else point
@@ -645,7 +656,7 @@ class Command(BaseCommand):
                                                                             expiration=exp_ts,
                                                                             is_pit_open=eat_status.is_pit_open
                                                                         )
-                                                                        order_res = client.place_market_order(req)
+                                                                        order_res = client.place_order(req)
 
                                                                         if order_res.get("retcode") in (10008, 10009):
                                                                             ticket_str = str(order_res.get("deal") or order_res.get("order") or "")
@@ -708,9 +719,10 @@ class Command(BaseCommand):
                                                                         else:
                                                                             self.stdout.write(f"MT5 Order execution failed [{sym}]: retcode={order_res.get('retcode')}, comment={order_res.get('comment')}")
                                                 except Exception as exec_err:
+                                                    logger.exception(f"Execution handling error [{sym}]: {exec_err}")
                                                     self.stderr.write(f"Execution handling error [{sym}]: {exec_err}")
                         except Exception as eval_err:
-                            pass
+                            logger.exception(f"Strategy evaluation error [{sym} {tf_enum.value}]: {eval_err}")
 
                 time.sleep(1)
             except KeyboardInterrupt:

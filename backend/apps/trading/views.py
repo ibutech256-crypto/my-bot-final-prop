@@ -145,7 +145,10 @@ class SignalViewSet(ActiveModelViewSet):
 
     def get_queryset(self):
         # Restrict to the last 50 signals to keep serialization lightning fast and prevent timeouts!
-        return Signal.objects.select_related("symbol", "author").filter(is_deleted=False).order_by("-created_at")[:50]
+        # NOTE: no slice here - slicing before DRF OrderingFilter runs raises
+        # "Cannot reorder a query once a slice has been taken." Bounding is handled
+        # by pagination / the ordering filter instead.
+        return Signal.objects.select_related("symbol", "author").filter(is_deleted=False, status="ACTIVE").order_by("-confidence", "-created_at")
 class OrderViewSet(ActiveModelViewSet): queryset=Order.objects.all(); serializer_class=serializers.OrderSerializer; permission_classes=[ReadOnlyOrPrivileged]
 class OpenPositionViewSet(ActiveModelViewSet): queryset=OpenPosition.objects.all(); serializer_class=serializers.OpenPositionSerializer; permission_classes=[ReadOnlyOrPrivileged]
 class ClosedTradeViewSet(ActiveModelViewSet): queryset=ClosedTrade.objects.all(); serializer_class=serializers.ClosedTradeSerializer; permission_classes=[ReadOnlyOrPrivileged]

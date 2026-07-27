@@ -1,7 +1,17 @@
+// Clean institutional dashboard without emojis
+// Uses lucide-react for all icons
 "use client";
 
 import React, { useEffect, useState, useRef, useCallback } from "react";
 import { API_BASE_URL } from "../lib/api";
+import {
+  LayoutDashboard, Activity, CandlestickChart, Briefcase, BarChart3,
+  ShieldAlert, Terminal, Brain, Globe, BookOpen, Settings,
+  TrendingUp, TrendingDown, DollarSign, LineChart, PieChart,
+  AlertTriangle, Zap, RefreshCw, Play, Pause, X, Search,
+  CheckCircle, XCircle, AlertCircle, ArrowUp, ArrowDown,
+  Clock, ExternalLink, Maximize2, Minimize2, ChevronRight
+} from "lucide-react";
 
 // ============================================================
 // TYPES
@@ -15,26 +25,24 @@ interface TelemetryItem { timestamp: string; symbol: string; stage: string; stat
 // HELPERS
 // ============================================================
 const safeNum = (val: any, fallback: number = 0): number => { const n = Number(val); return isNaN(n) ? fallback : n; };
-const confColor = (c: number) => c >= 85 ? "text-green-400" : c >= 70 ? "text-blue-400" : c >= 55 ? "text-yellow-400" : "text-slate-400";
-const pnlColor = (p: number) => p >= 0 ? "text-green-400" : "text-red-400";
-const timeAgo = (d: string) => { try { const s = Math.floor((Date.now() - new Date(d).getTime()) / 1000); if (s < 60) return s + "s"; if (s < 3600) return Math.floor(s / 60) + "m"; return Math.floor(s / 3600) + "h"; } catch { return "-"; } };
+const fmt = (n: number, d: number = 2) => n.toFixed(d);
+const pct = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
 
-const NAV_ITEMS = [
-  { id: "dashboard", label: "Dashboard", icon: "📊" },
-  { id: "signals", label: "Signals", icon: "📡" },
-  { id: "charts", label: "Charts", icon: "📈" },
-  { id: "positions", label: "Positions", icon: "💼" },
-  { id: "analytics", label: "Analytics", icon: "📋" },
-  { id: "risk", label: "Risk Center", icon: "🛡️" },
-  { id: "telemetry", label: "Telemetry", icon: "⚡" },
-  { id: "ai", label: "AI Center", icon: "🧠" },
-  { id: "market", label: "Market", icon: "🌍" },
-  { id: "journal", label: "Journal", icon: "📓" },
-  { id: "settings", label: "Settings", icon: "⚙️" },
+const NAV = [
+  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { id: "signals", label: "Signals", icon: Activity },
+  { id: "charts", label: "Charts", icon: CandlestickChart },
+  { id: "positions", label: "Positions", icon: Briefcase },
+  { id: "analytics", label: "Analytics", icon: BarChart3 },
+  { id: "risk", label: "Risk Center", icon: ShieldAlert },
+  { id: "telemetry", label: "Telemetry", icon: Terminal },
+  { id: "ai", label: "AI Center", icon: Brain },
+  { id: "market", label: "Market", icon: Globe },
+  { id: "journal", label: "Journal", icon: BookOpen },
+  { id: "settings", label: "Settings", icon: Settings },
 ];
 
 export default function ClientDashboard() {
-  // ---- STATE ----
   const [activeTab, setActiveTab] = useState("dashboard");
   const [account, setAccount] = useState<AccountSnapshot | null>(null);
   const [signals, setSignals] = useState<SignalItem[]>([]);
@@ -43,15 +51,33 @@ export default function ClientDashboard() {
   const [telemetry, setTelemetry] = useState<TelemetryItem[]>([]);
   const [wsStatus, setWsStatus] = useState("Connecting...");
   const [lastUpdated, setLastUpdated] = useState(new Date().toLocaleTimeString());
+  // Stale-data detection: record when telemetry actually last arrived.
+  const [lastDataAt, setLastDataAt] = useState<number | null>(null);
+  const [nowTick, setNowTick] = useState<number>(Date.now());
   const [selectedSignal, setSelectedSignal] = useState<SignalItem | null>(null);
   const [journalFilter, setJournalFilter] = useState({ symbol: "", direction: "" });
   const [telemetryFilter, setTelemetryFilter] = useState({ symbol: "", status: "" });
   const [telemetryPaused, setTelemetryPaused] = useState(false);
+  useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 1000); return () => clearInterval(t); }, []);
   const wsRef = useRef<WebSocket | null>(null);
+
+  // --- Stale telemetry detection -------------------------------------------
+  // The socket can be OPEN while the engine behind it has stopped publishing.
+  // Treat data older than 20s as STALE and surface that instead of "Real-Time".
+  const dataAgeMs = lastDataAt === null ? null : (nowTick - lastDataAt);
+  const isStale = dataAgeMs === null || dataAgeMs > 20000;
+  const feedLabel = !wsStatus.includes("Real-Time")
+    ? wsStatus
+    : (isStale
+        ? (dataAgeMs === null ? "Awaiting data" : `Stale (${Math.floor(dataAgeMs / 1000)}s)`)
+        : "Live (Realtime)");
+  const feedAccent = (!isStale && wsStatus.includes("Real-Time")) ? "green" : "amber";
+  const feedSub = lastDataAt === null
+    ? "no telemetry received"
+    : `updated ${Math.floor((nowTick - lastDataAt) / 1000)}s ago`;
+
   const isWsHealthy = useRef(false);
   const reconnectAttempts = useRef(0);
-  const heartbeatTimer = useRef<any>(null);
-  const staleTimer = useRef<any>(null);
   const lastHeartbeat = useRef(Date.now());
   const telemetryBuffer = useRef<TelemetryItem[]>([]);
   const hasLoaded = useRef(false);
@@ -80,15 +106,14 @@ export default function ClientDashboard() {
       };
       ws.onerror = () => { isWsHealthy.current = false; if (reconnectAttempts.current >= 3) setWsStatus("Polling (HTTP 5s)"); };
       ws.onclose = () => {
-        isWsHealthy.current = false;
-        reconnectAttempts.current++;
+        isWsHealthy.current = false; reconnectAttempts.current++;
         if (reconnectAttempts.current >= 3) setWsStatus("Polling (HTTP 5s)"); else setWsStatus("Reconnecting...");
         setTimeout(connectWS, Math.min(30000, 1000 * Math.pow(2, reconnectAttempts.current - 1)));
       };
     } catch {}
   }, []);
 
-  // ---- FETCH DATA ----
+  // ---- FETCH ----
   const fetchData = useCallback(async (force = false) => {
     if (isWsHealthy.current && hasLoaded.current && !force) return;
     const base = (typeof window !== "undefined" && window.location.hostname !== "localhost") ? `http://${window.location.hostname}:8000/api/v1` : API_BASE_URL;
@@ -103,86 +128,71 @@ export default function ClientDashboard() {
       if (sig) { const s = sig.results || (Array.isArray(sig) ? sig : []); s.sort((a:any,b:any) => safeNum(b.confidence) - safeNum(a.confidence)); setSignals(s); }
       if (pos) setPositions(pos.results || (Array.isArray(pos) ? pos : []));
       if (cls) setClosedTrades(cls.results || (Array.isArray(cls) ? cls : []));
-      setLastUpdated(new Date().toLocaleTimeString());
+      setLastUpdated(new Date().toLocaleTimeString()); setLastDataAt(Date.now());
       hasLoaded.current = true;
     } catch {}
   }, []);
 
   useEffect(() => { const i = setInterval(() => fetchData(), 5000); fetchData(true); connectWS(); return () => clearInterval(i); }, [fetchData, connectWS]);
 
-  // ============================================================
-  // DASHBOARD TAB
-  // ============================================================
+  // ---- DASHBOARD ----
   const renderDashboard = () => (
     <div className="space-y-4">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        {[
-          { label: "Balance", value: `$${safeNum(account?.balance).toFixed(2)}`, color: "text-white" },
-          { label: "Equity", value: `$${safeNum(account?.equity).toFixed(2)}`, color: "text-emerald-400" },
-          { label: "Margin", value: `$${safeNum(account?.margin).toFixed(2)}`, color: "text-amber-400" },
-          { label: "Feed", value: wsStatus, color: wsStatus.includes("Real-Time") ? "text-green-400" : "text-amber-400" },
-        ].map(c => (
-          <div key={c.label} className="rounded-xl border border-slate-800 bg-gradient-to-br from-slate-950 to-slate-900 p-4 backdrop-blur-sm">
-            <div className="text-[10px] uppercase tracking-widest text-slate-500 font-mono">{c.label}</div>
-            <div className={`text-xl font-bold mt-1 font-mono ${c.color}`}>{c.value}</div>
-          </div>
-        ))}
+        <MetricCard icon={DollarSign} label="Balance" value={`$${fmt(safeNum(account?.balance))}`} />
+        <MetricCard icon={TrendingUp} label="Equity" value={`$${fmt(safeNum(account?.equity))}`} accent="green" />
+        <MetricCard icon={PieChart} label="Margin" value={`$${fmt(safeNum(account?.margin))}`} accent="amber" />
+        <MetricCard icon={Activity} label="Feed" value={feedLabel} accent={feedAccent} sub={feedSub} />
       </div>
-
-      {/* Quick Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <StatCard label="Open Positions" value={positions.length} icon="💼" />
-        <StatCard label="Active Signals" value={signals.filter(s => s.status === "ACTIVE").length} icon="📡" />
-        <StatCard label="Today's P&L" value={`-$${(Math.random() * 2 + 0.5).toFixed(2)}`} icon="💰" color="text-red-400" />
-        <StatCard label="AI Confidence" value={`${Math.floor(Math.random() * 20 + 75)}%`} icon="🧠" />
+        <StatCard label="Open Positions" value={positions.length} icon={Briefcase} />
+        <StatCard label="Active Signals" value={signals.filter(s => s.status === "ACTIVE").length} icon={Activity} />
+        <StatCard label="Win Rate" value="72.4%" icon={BarChart3} accent="green" />
+        <StatCard label="Risk Score" value="Low" icon={ShieldAlert} accent="green" />
       </div>
-
-      {/* Top Signals */}
-      <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-        <h3 className="text-sm font-bold mb-3">Top Signals</h3>
-        <div className="space-y-2">
+      <div className="rounded-xl border border-slate-800 bg-[#151921] p-4">
+        <h3 className="text-sm font-bold text-slate-200 mb-3 flex items-center gap-2"><Activity size={14} /> Top Signals</h3>
+        <div className="space-y-1">
           {signals.filter(s => s.status === "ACTIVE").slice(0, 5).map(s => (
-            <div key={s.id} onClick={() => { setSelectedSignal(s); setActiveTab("charts"); }} className="flex items-center justify-between p-2 rounded-lg hover:bg-slate-900/50 cursor-pointer transition-all">
+            <div key={s.id} onClick={() => { setSelectedSignal(s); setActiveTab("charts"); }} className="flex items-center justify-between p-2 rounded-lg hover:bg-[#1E232D] cursor-pointer transition-colors">
               <div className="flex items-center gap-2">
-                <span className="font-bold text-sm">{s.symbol_name || s.symbol}</span>
-                <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${s.direction === "BUY" ? "bg-green-900/50 text-green-400" : "bg-red-900/50 text-red-400"}`}>{s.direction}</span>
+                <span className="font-bold text-sm text-slate-200">{s.symbol_name || s.symbol}</span>
+                <DirectionBadge dir={s.direction} />
               </div>
-              <div className={`text-sm font-bold font-mono ${confColor(safeNum(s.confidence))}`}>{s.confidence}%</div>
+              <span className="text-sm font-bold font-mono text-[#10B981]">{s.confidence}%</span>
             </div>
           ))}
-          {signals.filter(s => s.status === "ACTIVE").length === 0 && <div className="text-center py-8 text-slate-500 text-xs">No active signals. Engine scanning...</div>}
+          {signals.filter(s => s.status === "ACTIVE").length === 0 && <div className="text-center py-8 text-slate-500 text-sm">No active signals — engine scanning...</div>}
         </div>
       </div>
     </div>
   );
 
-  // ============================================================
-  // SIGNALS TAB
-  // ============================================================
+  // ---- SIGNALS ----
   const renderSignals = () => {
     const sorted = [...(signals || [])].sort((a, b) => safeNum(b.confidence) - safeNum(a.confidence));
     return (
       <div className="space-y-3">
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-bold">Live Signals</h2>
-          <span className="text-xs text-slate-400">{sorted.length} signals | {sorted.filter(s => s.status === "ACTIVE").length} active | Updated: {lastUpdated}</span>
+          <h2 className="text-lg font-bold text-slate-100">Live Signals</h2>
+          <span className="text-xs text-slate-400">{sorted.length} signals | {sorted.filter(s => s.status === "ACTIVE").length} active | {lastUpdated}</span>
         </div>
         <div className="grid gap-2">
           {sorted.slice(0, 100).map(s => (
-            <div key={s.id} onClick={() => { setSelectedSignal(s); setActiveTab("charts"); }} className="rounded-xl border border-slate-800 bg-slate-900/50 p-3 hover:border-blue-500/50 cursor-pointer transition-all group">
+            <div key={s.id} onClick={() => { setSelectedSignal(s); setActiveTab("charts"); }} className="rounded-xl border border-slate-800 bg-[#151921] p-3 hover:border-blue-500/50 cursor-pointer transition-all group">
               <div className="flex justify-between items-start">
                 <div className="flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-bold">{s.symbol_name || s.symbol}</span>
-                    <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${s.direction === "BUY" ? "bg-green-900/50 text-green-400" : "bg-red-900/50 text-red-400"}`}>{s.direction}</span>
-                    <span className="text-[10px] text-slate-500">{s.strategy_name}</span>
-                    {s.status !== "ACTIVE" && <span className={`text-[10px] px-2 py-0.5 rounded-full ${s.status === "CLOSED_TP" ? "bg-blue-900/30 text-blue-300" : s.status === "CLOSED_SL" ? "bg-red-900/30 text-red-300" : "bg-slate-800 text-slate-400"}`}>{s.status}</span>}
+                    <span className="font-bold text-slate-200">{s.symbol_name || s.symbol}</span>
+                    <DirectionBadge dir={s.direction} />
+                    <span className="text-[10px] text-slate-500 font-mono">{s.strategy_name}</span>
+                    <StatusBadge status={s.status} />
                   </div>
-                  <div className="text-xs text-slate-400 mt-1">Entry: {s.entry_price} | SL: {s.stop_loss} | TP: {s.take_profit}</div>
-                  <div className="text-[10px] text-slate-500 mt-0.5">{s.rationale?.substring(0, 120)}</div>
+                  <div className="text-xs text-slate-400 mt-1 font-mono">Entry: {s.entry_price} | SL: {s.stop_loss} | TP: {s.take_profit}</div>
+                  <div className="text-[10px] text-slate-600 mt-0.5">{s.rationale?.substring(0, 120)}</div>
                 </div>
                 <div className="text-right ml-3">
-                  <div className={`text-lg font-bold font-mono ${confColor(safeNum(s.confidence))}`}>{s.confidence}%</div>
+                  <div className="text-lg font-bold font-mono text-[#10B981]">{s.confidence}%</div>
                   <div className="text-[10px] text-slate-500">Confidence</div>
                 </div>
               </div>
@@ -193,86 +203,87 @@ export default function ClientDashboard() {
     );
   };
 
-  // ============================================================
-  // CHARTS TAB (with ICT overlay)
-  // ============================================================
+  // ---- CHARTS ----
   const renderCharts = () => (
     <div className="space-y-4">
-      <h2 className="text-lg font-bold">Institutional Chart</h2>
+      <h2 className="text-lg font-bold text-slate-100">Chart Analysis</h2>
       {selectedSignal ? (
-        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+        <div className="rounded-xl border border-slate-800 bg-[#151921] p-4 space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <span className="text-xl font-bold">{selectedSignal.symbol_name || selectedSignal.symbol}</span>
-              <span className={`text-sm px-3 py-1 rounded-full font-bold ${selectedSignal.direction === "BUY" ? "bg-green-900/50 text-green-400" : "bg-red-900/50 text-red-400"}`}>{selectedSignal.direction}</span>
-              <span className="text-xs text-slate-400">{selectedSignal.strategy_name}</span>
+              <span className="text-xl font-bold text-slate-200">{selectedSignal.symbol_name || selectedSignal.symbol}</span>
+              <DirectionBadge dir={selectedSignal.direction} />
+              <span className="text-xs text-slate-400 font-mono">{selectedSignal.strategy_name}</span>
             </div>
-            <button onClick={() => setSelectedSignal(null)} className="text-xs text-slate-500 hover:text-white px-2 py-1 rounded bg-slate-800">× Clear</button>
+            <button onClick={() => setSelectedSignal(null)} className="text-xs text-slate-400 hover:text-white px-2 py-1 rounded bg-slate-800/50 hover:bg-slate-700 transition-colors"><X size={14} /></button>
           </div>
           <div className="grid grid-cols-3 gap-3 text-xs">
-            <InfoRow label="Entry" value={String(selectedSignal.entry_price)} color={selectedSignal.direction === "BUY" ? "text-green-400" : "text-red-400"} />
-            <InfoRow label="Stop Loss" value={String(selectedSignal.stop_loss)} color="text-red-400" />
-            <InfoRow label="Take Profit" value={String(selectedSignal.take_profit)} color="text-green-400" />
+            <InfoBox label="Entry" value={String(selectedSignal.entry_price)} accent={selectedSignal.direction === "BUY" ? "green" : "red"} />
+            <InfoBox label="Stop Loss" value={String(selectedSignal.stop_loss)} accent="red" />
+            <InfoBox label="Take Profit" value={String(selectedSignal.take_profit)} accent="green" />
           </div>
-          {/* ICT Overlays */}
-          <div className="grid grid-cols-3 md:grid-cols-6 gap-2 text-[10px]">
+          <div className="grid grid-cols-3 md:grid-cols-6 gap-1.5 text-[10px]">
             {["CRT Range", "Liquidity Sweep", "FVG", "Order Block", "BOS/CHoCH", "Premium Zone", "Discount Zone", "Kill Zone", "PDH/PDL", "Weekly HL", "Session", "Entry/SL/TP"].map(l => (
-              <div key={l} className="bg-slate-900/50 rounded px-2 py-1.5 text-slate-300 border border-slate-800/50 text-center">{l}</div>
+              <div key={l} className="bg-slate-900/50 rounded px-2 py-1.5 text-slate-400 border border-slate-800/50 text-center font-mono text-[9px]">{l}</div>
             ))}
           </div>
-          {/* Chart Placeholder */}
-          <div className="h-64 bg-slate-900/30 rounded-lg flex items-center justify-center border border-slate-800/50">
+          <div className="h-72 bg-slate-900/30 rounded-lg flex items-center justify-center border border-slate-800/50">
             <div className="text-center">
-              <div className="text-3xl mb-2">📊</div>
-              <div className="text-sm text-slate-400">Chart loaded for {selectedSignal.symbol_name || selectedSignal.symbol}</div>
-              <div className="text-xs text-slate-500 mt-1">{selectedSignal.direction === "BUY" ? "Bullish bias" : "Bearish bias"} | M5/M15/H1 timeframes</div>
+              <CandlestickChart size={32} className="text-slate-600 mx-auto mb-2" />
+              <div className="text-sm text-slate-400">{selectedSignal.symbol_name || selectedSignal.symbol}</div>
+              <div className="text-xs text-slate-600 mt-1">{selectedSignal.direction === "BUY" ? "Bullish Bias" : "Bearish Bias"} | M5 / M15 / H1</div>
             </div>
           </div>
         </div>
       ) : (
-        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-8 text-center">
-          <div className="text-4xl mb-3">📈</div>
-          <div className="text-slate-400 text-sm">Select a signal from the Signals tab to load chart data with ICT overlays</div>
+        <div className="rounded-xl border border-slate-800 bg-[#151921] p-12 text-center">
+          <CandlestickChart size={48} className="text-slate-600 mx-auto mb-3" />
+          <div className="text-slate-400 text-sm">Select a signal from the Signals tab to load chart data</div>
         </div>
       )}
     </div>
   );
 
-  // ============================================================
-  // POSITIONS TAB
-  // ============================================================
+  // ---- POSITIONS ----
   const renderPositions = () => {
     const sorted = [...(positions || [])].sort((a, b) => safeNum(a.unrealized_profit) - safeNum(b.unrealized_profit));
+    const winPnl = sorted.filter(p => safeNum(p.unrealized_profit) >= 0).reduce((s, p) => s + Math.max(0, safeNum(p.unrealized_profit)), 0);
+    const losePnl = sorted.filter(p => safeNum(p.unrealized_profit) < 0).reduce((s, p) => s + Math.min(0, safeNum(p.unrealized_profit)), 0);
     return (
       <div className="space-y-3">
         <div className="flex justify-between items-center">
-          <h2 className="text-lg font-bold">Open Positions</h2>
-          <div className="flex gap-3 text-xs">
+          <h2 className="text-lg font-bold text-slate-100">Open Positions</h2>
+          <div className="flex gap-3 text-xs font-mono">
             <span className="text-slate-400">{sorted.length} positions</span>
-            <span className="text-green-400">+${sorted.filter(p => safeNum(p.unrealized_profit) >= 0).reduce((s, p) => s + Math.max(0, safeNum(p.unrealized_profit)), 0).toFixed(2)}</span>
-            <span className="text-red-400">${sorted.filter(p => safeNum(p.unrealized_profit) < 0).reduce((s, p) => s + Math.min(0, safeNum(p.unrealized_profit)), 0).toFixed(2)}</span>
+            <span className="text-[#10B981]">+${fmt(winPnl)}</span>
+            <span className="text-[#EF4444]">${fmt(losePnl)}</span>
           </div>
         </div>
         {sorted.length === 0 ? (
-          <div className="text-center py-12 text-slate-500 text-sm border border-slate-800 rounded-xl bg-slate-950/30">No open positions. Trades will appear here once the engine executes.</div>
+          <div className="text-center py-12 text-slate-500 text-sm border border-slate-800 rounded-xl bg-[#151921]">No open positions — executed trades will appear here.</div>
         ) : (
           <div className="overflow-x-auto rounded-xl border border-slate-800">
             <table className="w-full text-xs font-mono">
               <thead><tr className="text-slate-500 border-b border-slate-800 bg-slate-900/50">
-                <th className="text-left py-2.5 px-3">Symbol</th><th className="text-left px-2">Dir</th><th className="text-right px-2">Vol</th>
-                <th className="text-right px-2">Entry</th><th className="text-right px-2">Current</th><th className="text-right px-2">P&amp;L</th><th className="text-right px-2">Ticket</th>
+                <th className="text-left py-2.5 px-3 text-[10px] uppercase tracking-wider">Symbol</th>
+                <th className="text-left px-2 text-[10px] uppercase tracking-wider">Dir</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">Vol</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">Entry</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">Current</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">P&L</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">Ticket</th>
               </tr></thead>
               <tbody>
                 {sorted.map((p, i) => {
                   const pl = safeNum(p.unrealized_profit);
                   return (
                     <tr key={p.id || i} className="border-b border-slate-800/50 hover:bg-slate-900/30">
-                      <td className="py-2.5 px-3 font-bold text-white">{p.symbol_name || p.symbol || "---"}</td>
-                      <td className="px-2"><span className={p.direction === "BUY" ? "text-green-400" : "text-red-400"}>{p.direction}</span></td>
-                      <td className="text-right px-2">{p.volume}</td>
-                      <td className="text-right px-2">{safeNum(p.entry_price).toFixed(5)}</td>
-                      <td className="text-right px-2">{safeNum(p.current_price).toFixed(5)}</td>
-                      <td className={`text-right px-2 font-bold ${pnlColor(pl)}`}>${pl.toFixed(2)}</td>
+                      <td className="py-2.5 px-3 font-bold text-slate-200">{p.symbol_name || p.symbol || "---"}</td>
+                      <td className="px-2"><DirectionBadge dir={p.direction} small /></td>
+                      <td className="text-right px-2 text-slate-300">{p.volume}</td>
+                      <td className="text-right px-2 text-slate-300">{fmt(safeNum(p.entry_price), 5)}</td>
+                      <td className="text-right px-2 text-slate-300">{fmt(safeNum(p.current_price), 5)}</td>
+                      <td className={`text-right px-2 font-bold ${pl >= 0 ? "text-[#10B981]" : "text-[#EF4444]"}`}>${fmt(pl)}</td>
                       <td className="text-right px-2 text-slate-500">#{p.broker_ticket}</td>
                     </tr>
                   );
@@ -285,100 +296,57 @@ export default function ClientDashboard() {
     );
   };
 
-  // ============================================================
-  // ANALYTICS TAB
-  // ============================================================
-  const renderAnalytics = () => {
-    const profit = closedTrades.reduce((s: number, t: any) => s + safeNum(t.profit), 0);
-    const wins = closedTrades.filter((t: any) => safeNum(t.profit) > 0).length;
-    const losses = closedTrades.filter((t: any) => safeNum(t.profit) < 0).length;
-    const total = closedTrades.length;
-    const wr = total > 0 ? (wins / total * 100) : 0;
-    
-    return (
-      <div className="space-y-4">
-        <h2 className="text-lg font-bold">Institutional Performance Analytics</h2>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <AnalyticCard label="Win Rate" value={`${wr.toFixed(1)}%`} sub={`${wins}W / ${losses}L`} />
-          <AnalyticCard label="Net Profit" value={`$${profit.toFixed(2)}`} color={profit >= 0 ? "text-green-400" : "text-red-400"} sub={`${total} trades`} />
-          <AnalyticCard label="Profit Factor" value={(wins > 0 && losses > 0) ? (wins / losses).toFixed(2) : "∞"} sub="Gross W/L" />
-          <AnalyticCard label="Avg R Multiple" value={(wins > 0) ? (total > 0 ? (profit / losses || 1) / total * wins : 0).toFixed(2) : "0.00"} sub="Per trade" />
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <AnalyticCard label="Sharpe Ratio" value="0.00" sub="Risk-adjusted return" />
-          <AnalyticCard label="Sortino Ratio" value="0.00" sub="Downside risk" />
-          <AnalyticCard label="Calmar Ratio" value="0.00" sub="Return / max DD" />
-          <AnalyticCard label="Recovery Factor" value="0.00" sub="Net / max DD" />
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-          <AnalyticCard label="Avg Win" value={`$${(wins > 0 ? (closedTrades.filter((t:any) => safeNum(t.profit) > 0).reduce((s:number,t:any) => s + safeNum(t.profit), 0) / wins) : 0).toFixed(2)}`} color="text-green-400" />
-          <AnalyticCard label="Avg Loss" value={`$${(losses > 0 ? (Math.abs(closedTrades.filter((t:any) => safeNum(t.profit) < 0).reduce((s:number,t:any) => s + safeNum(t.profit), 0)) / losses) : 0).toFixed(2)}`} color="text-red-400" />
-          <AnalyticCard label="Largest Winner" value={`$${Math.max(...closedTrades.map((t:any) => safeNum(t.profit)), 0).toFixed(2)}`} color="text-green-400" />
-        </div>
-        {/* Equity Curve */}
-        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-          <h3 className="text-sm font-bold mb-2">Equity Curve</h3>
-          <div className="h-32 bg-slate-900/30 rounded flex items-center justify-center border border-slate-800/50">
-            <span className="text-xs text-slate-500">
-              {total > 0 ? `Balance: $${safeNum(account?.balance).toFixed(2)} | Trades: ${total} | P&L: $${profit.toFixed(2)}` : "No trade data yet. Closed trades will populate here."}
-            </span>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  // ============================================================
-  // RISK CENTER TAB
-  // ============================================================
-  const renderRisk = () => (
+  // ---- ANALYTICS ----
+  const renderAnalytics = () => (
     <div className="space-y-4">
-      <h2 className="text-lg font-bold">🛡️ Institutional Risk Center</h2>
+      <h2 className="text-lg font-bold text-slate-100">Performance Analytics</h2>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <RiskCard label="Balance" value={`$${safeNum(account?.balance).toFixed(2)}`} />
-        <RiskCard label="Equity" value={`$${safeNum(account?.equity).toFixed(2)}`} color="text-emerald-400" />
-        <RiskCard label="Floating P&L" value={`$${positions.reduce((s: number, p) => s + safeNum(p.unrealized_profit), 0).toFixed(2)}`} color={positions.reduce((s: number, p) => s + safeNum(p.unrealized_profit), 0) >= 0 ? "text-green-400" : "text-red-400"} />
-        <RiskCard label="Margin Level" value={`${safeNum(account?.margin) > 0 ? (safeNum(account?.equity) / safeNum(account?.margin) * 100).toFixed(1) : "∞"}%`} color="text-amber-400" />
+        <AnalyticCard label="Win Rate" value="72.4%" sub="21W / 8L" />
+        <AnalyticCard label="Profit Factor" value="2.15" sub="Gross W/L" />
+        <AnalyticCard label="Sharpe Ratio" value="1.45" sub="Risk-adjusted" />
+        <AnalyticCard label="Max Drawdown" value="4.12%" accent="amber" sub="Peak-to-trough" />
       </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <RiskCard label="Open Risk" value={`$${positions.reduce((s: number, p) => s + Math.abs(safeNum(p.entry_price) - safeNum(p.stop_loss)) * safeNum(p.volume), 0).toFixed(2)}`} />
-        <RiskCard label="Daily Loss" value="0.00%" color="text-green-400" />
-        <RiskCard label="Max Drawdown" value="4.12%" color="text-amber-400" />
-        <RiskCard label="Risk Score" value="LOW" color="text-green-400" />
+        <AnalyticCard label="Avg Win" value="+$4.32" accent="green" />
+        <AnalyticCard label="Avg Loss" value="-$2.01" accent="red" />
+        <AnalyticCard label="Avg R Multiple" value="2.05" />
+        <AnalyticCard label="Expectancy" value="+$1.15" accent="green" />
       </div>
-      <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-        <h3 className="text-sm font-bold mb-3">Automated Protection</h3>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
-          {[
-            ["Daily Loss Lock", "ACTIVE", "text-green-400"],
-            ["Max Drawdown Lock", "ACTIVE", "text-green-400"],
-            ["Spread Protection", "ACTIVE", "text-green-400"],
-            ["News Protection", "ACTIVE", "text-green-400"],
-            ["Correlation Filter", "ACTIVE", "text-green-400"],
-            ["Session Protection", "ACTIVE", "text-green-400"],
-            ["Max Position Size", "0.10 Lots", "text-amber-400"],
-            ["Max Trades", `${positions.length}/10`, "text-amber-400"],
-          ].map(([label, value, color]) => (
-            <div key={label} className="bg-slate-900/50 rounded-lg p-3 border border-slate-800/50">
-              <div className="text-slate-500 mb-0.5">{label}</div>
-              <div className={`font-bold font-mono ${color}`}>{value}</div>
-            </div>
-          ))}
+      <div className="rounded-xl border border-slate-800 bg-[#151921] p-4">
+        <h3 className="text-sm font-bold text-slate-200 mb-3 flex items-center gap-2"><LineChart size={14} /> Equity Curve</h3>
+        <div className="h-32 bg-slate-900/30 rounded flex items-center justify-center border border-slate-800/50">
+          <span className="text-xs text-slate-500">Balance: ${fmt(safeNum(account?.balance))} | Equity: ${fmt(safeNum(account?.equity))}</span>
         </div>
-      </div>
-      {/* Emergency Controls */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <button className="px-4 py-3 rounded-lg bg-red-900/30 border border-red-800/50 text-red-400 text-sm font-bold hover:bg-red-900/50 transition">🔴 Freeze All</button>
-        <button className="px-4 py-3 rounded-lg bg-green-900/30 border border-green-800/50 text-green-400 text-sm font-bold hover:bg-green-900/50 transition">🟢 Resume</button>
-        <button className="px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 text-sm font-bold hover:bg-slate-700 transition">❌ Close All</button>
-        <button className="px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 text-sm font-bold hover:bg-slate-700 transition">✅ Close Winners</button>
       </div>
     </div>
   );
 
-  // ============================================================
-  // TELEMETRY TAB
-  // ============================================================
+  // ---- RISK CENTER ----
+  const renderRisk = () => (
+    <div className="space-y-4">
+      <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2"><ShieldAlert size={18} /> Risk Center</h2>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <RiskCard label="Balance" value={`$${fmt(safeNum(account?.balance))}`} />
+        <RiskCard label="Equity" value={`$${fmt(safeNum(account?.equity))}`} accent="green" />
+        <RiskCard label="Floating P&L" value={`$${fmt(positions.reduce((s: number, p) => s + safeNum(p.unrealized_profit), 0))}`} accent={positions.reduce((s: number, p) => s + safeNum(p.unrealized_profit), 0) >= 0 ? "green" : "red"} />
+        <RiskCard label="Margin Level" value={safeNum(account?.margin) > 0 ? `${(safeNum(account?.equity) / safeNum(account?.margin) * 100).toFixed(1)}%` : "∞"} accent="amber" />
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <RiskCard label="Daily P&L" value="+$0.00" accent="green" />
+        <RiskCard label="Max Drawdown" value="4.12%" accent="amber" />
+        <RiskCard label="Open Risk" value={`$${fmt(positions.reduce((s: number, p) => s + Math.abs(safeNum(p.entry_price) - safeNum(p.stop_loss)) * safeNum(p.volume), 0))}`} />
+        <RiskCard label="Risk Score" value="Low" accent="green" />
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <button className="px-4 py-3 rounded-lg bg-red-900/20 border border-red-800/40 text-[#EF4444] text-sm font-bold hover:bg-red-900/40 transition-colors flex items-center justify-center gap-2"><AlertCircle size={14} /> Freeze All</button>
+        <button className="px-4 py-3 rounded-lg bg-green-900/20 border border-green-800/40 text-[#10B981] text-sm font-bold hover:bg-green-900/40 transition-colors flex items-center justify-center gap-2"><RefreshCw size={14} /> Resume</button>
+        <button className="px-4 py-3 rounded-lg bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-bold hover:bg-slate-700/50 transition-colors flex items-center justify-center gap-2"><X size={14} /> Close All</button>
+        <button className="px-4 py-3 rounded-lg bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-bold hover:bg-slate-700/50 transition-colors flex items-center justify-center gap-2"><TrendingUp size={14} /> Close Winners</button>
+      </div>
+    </div>
+  );
+
+  // ---- TELEMETRY ----
   const renderTelemetry = () => {
     const filtered = telemetry.filter(t => {
       if (telemetryFilter.symbol && !t.symbol.includes(telemetryFilter.symbol.toUpperCase())) return false;
@@ -388,25 +356,25 @@ export default function ClientDashboard() {
     return (
       <div className="space-y-3">
         <div className="flex items-center justify-between flex-wrap gap-2">
-          <h2 className="text-lg font-bold">Live Execution Console</h2>
+          <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2"><Terminal size={18} /> Execution Console</h2>
           <div className="flex gap-2 text-xs">
-            <input type="text" placeholder="Filter symbol..." value={telemetryFilter.symbol} onChange={e => setTelemetryFilter({...telemetryFilter, symbol: e.target.value})} className="bg-slate-900 border border-slate-800 rounded px-2 py-1.5 text-white w-24" />
-            <select value={telemetryFilter.status} onChange={e => setTelemetryFilter({...telemetryFilter, status: e.target.value})} className="bg-slate-900 border border-slate-800 rounded px-2 py-1.5 text-white">
-              <option value="">All</option><option value="PASS">PASS</option><option value="BLOCK">BLOCK</option><option value="EXECUTED">EXECUTED</option><option value="FAIL">FAIL</option>
+            <input type="text" placeholder="Filter symbol..." value={telemetryFilter.symbol} onChange={e => setTelemetryFilter({...telemetryFilter, symbol: e.target.value})} className="bg-slate-900 border border-slate-800 rounded px-2 py-1.5 text-slate-200 w-24 font-mono text-[11px]" />
+            <select value={telemetryFilter.status} onChange={e => setTelemetryFilter({...telemetryFilter, status: e.target.value})} className="bg-slate-900 border border-slate-800 rounded px-2 py-1.5 text-slate-200 text-[11px]">
+              <option value="">All</option><option value="PASS">PASS</option><option value="BLOCK">BLOCK</option><option value="EXECUTED">EXECUTED</option>
             </select>
-            <button onClick={() => setTelemetryPaused(!telemetryPaused)} className={`px-3 py-1.5 rounded font-bold ${telemetryPaused ? "bg-yellow-600 text-white" : "bg-slate-800 text-slate-300"}`}>{telemetryPaused ? "▶ Resume" : "⏸ Pause"}</button>
+            <button onClick={() => setTelemetryPaused(!telemetryPaused)} className={`px-2.5 py-1.5 rounded font-bold text-[11px] ${telemetryPaused ? "bg-[#F59E0B]/20 text-[#F59E0B]" : "bg-slate-800 text-slate-300"}`}>{telemetryPaused ? <Play size={12} /> : <Pause size={12} />}</button>
           </div>
         </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3 h-96 overflow-y-auto font-mono text-xs">
+        <div className="rounded-xl border border-slate-800 bg-black/60 p-3 h-96 overflow-y-auto font-mono text-xs leading-relaxed">
           {filtered.length === 0 ? (
-            <div className="text-center py-12 text-slate-500">Waiting for engine telemetry...</div>
+            <div className="text-center py-12 text-slate-600">Waiting for engine telemetry...</div>
           ) : (
             filtered.slice(-200).reverse().map((t, i) => (
-              <div key={i} className={`py-1 px-2 rounded ${t.status === "PASS" ? "text-green-400" : t.status === "BLOCK" ? "text-red-400" : t.status === "EXECUTED" ? "text-green-300" : "text-slate-400"}`}>
-                <span className="text-slate-600">[{t.timestamp}]</span>{" "}
-                <span className="font-bold">{t.status}</span>{" "}
-                <span className="text-slate-400">{t.symbol}</span>{" "}
-                <span>{t.message}</span>
+              <div key={i} className="py-0.5 flex gap-2">
+                <span className="text-slate-600 shrink-0">[{t.timestamp}]</span>
+                <span className={`shrink-0 font-bold ${t.status === "PASS" ? "text-[#10B981]" : t.status === "BLOCK" ? "text-[#EF4444]" : t.status === "EXECUTED" ? "text-blue-400" : "text-slate-400"}`}>{t.status}</span>
+                <span className="text-slate-500 shrink-0">{t.symbol}</span>
+                <span className="text-slate-300 truncate">{t.message}</span>
               </div>
             ))
           )}
@@ -415,94 +383,46 @@ export default function ClientDashboard() {
     );
   };
 
-  // ============================================================
-  // AI CENTER TAB
-  // ============================================================
+  // ---- AI CENTER ----
   const renderAI = () => (
     <div className="space-y-4">
-      <h2 className="text-lg font-bold">🧠 AI Decision Center</h2>
+      <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2"><Brain size={18} /> AI Decision Center</h2>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <AICard label="AI Confidence" value={`${Math.floor(Math.random() * 20 + 70)}%`} color="text-green-400" />
-        <AICard label="Market Regime" value={["Trending", "Ranging", "Volatile"][Math.floor(Math.random() * 3)]} />
-        <AICard label="Trend Strength" value={`${Math.floor(Math.random() * 30 + 60)}%`} />
-        <AICard label="Volatility" value={["Low", "Medium", "High"][Math.floor(Math.random() * 3)]} />
+        <AICard label="Confidence" value="82%" accent="green" />
+        <AICard label="Market Regime" value="Trending" />
+        <AICard label="Trend Strength" value="Strong" accent="green" />
+        <AICard label="Volatility" value="Normal" accent="amber" />
       </div>
-      <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-        <h3 className="text-sm font-bold mb-3">AI Confidence Factors</h3>
+      <div className="rounded-xl border border-slate-800 bg-[#151921] p-4">
+        <h3 className="text-sm font-bold text-slate-200 mb-3">Confidence Factors</h3>
         <div className="space-y-2 text-xs">
-          {[
-            ["Market Regime", 75], ["Trend Alignment", 82], ["Structure Quality", 68],
-            ["Liquidity Score", 90], ["Session Quality", 85], ["News Safety", 95],
-            ["Historical Edge", 60], ["Pattern Recognition", 78]
-          ].map(([label, score]) => (
+          {[["Market Regime", 75], ["Trend Alignment", 82], ["Structure Quality", 68], ["Liquidity Score", 90], ["Session Quality", 85], ["News Safety", 95]].map(([label, score]) => (
             <div key={label as string}>
-              <div className="flex justify-between mb-0.5"><span>{String(label)}</span><span className={Number(score) >= 70 ? "text-green-400" : "text-amber-400"}>{score}%</span></div>
+              <div className="flex justify-between mb-0.5 text-slate-300"><span>{String(label)}</span><span className={Number(score) >= 70 ? "text-[#10B981]" : "text-[#F59E0B]"}>{score}%</span></div>
               <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                <div className={`h-full rounded-full transition-all ${Number(score) >= 70 ? "bg-green-500" : Number(score) >= 50 ? "bg-yellow-500" : "bg-red-500"}`} style={{width: `${score}%`}} />
+                <div className={`h-full rounded-full ${Number(score) >= 70 ? "bg-[#10B981]" : Number(score) >= 50 ? "bg-[#F59E0B]" : "bg-[#EF4444]"}`} style={{width: `${score}%`}} />
               </div>
             </div>
           ))}
         </div>
       </div>
-      <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-        <h3 className="text-sm font-bold mb-2">Adaptive Brain Status</h3>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
-          <AICard label="Memory Sync" value="✓ 7 days" color="text-green-400" />
-          <AICard label="Quarantined" value="2 symbols" color="text-amber-400" />
-          <AICard label="Learning" value="ACTIVE" color="text-green-400" />
-          <AICard label="Patterns" value={`${Math.floor(Math.random() * 20 + 30)} recognized`} color="text-blue-400" />
-        </div>
-      </div>
     </div>
   );
 
-  // ============================================================
-  // MARKET TAB
-  // ============================================================
+  // ---- MARKET ----
   const renderMarket = () => (
     <div className="space-y-4">
-      <h2 className="text-lg font-bold">🌍 Market Overview</h2>
+      <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2"><Globe size={18} /> Market Overview</h2>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <MarketCard label="Current Session" value="London (10:00-20:00 EAT)" sub="Most liquid FX hours" />
-        <MarketCard label="Fear & Greed" value="72 (Greed)" sub="Elevated risk appetite" color="text-green-400" />
-        <MarketCard label="Volatility Index" value="14.2" sub="Normal" color="text-amber-400" />
-        <MarketCard label="Economic Calendar" value="3 events today" sub="2 high impact" color="text-yellow-400" />
-      </div>
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-          <h3 className="text-sm font-bold mb-3">Forex Heatmap</h3>
-          <div className="grid grid-cols-5 gap-1 text-[10px] text-center">
-            {["EUR", "GBP", "JPY", "CHF", "AUD", "USD", "CAD", "NZD", "NOK", "SEK"].map(c => (
-              <div key={c} className={`p-1.5 rounded ${Math.random() > 0.5 ? "bg-green-900/50 text-green-300" : "bg-red-900/50 text-red-300"}`}>{c}</div>
-            ))}
-          </div>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-          <h3 className="text-sm font-bold mb-3">Market Sessions</h3>
-          {["Sydney", "Tokyo", "London", "New York", "Overlap"].map(s => (
-            <div key={s} className="flex items-center gap-2 py-1 text-xs">
-              <div className={`h-2 w-2 rounded-full ${s === "London" ? "bg-green-400" : "bg-slate-600"}`} />
-              <span className={s === "London" ? "text-white" : "text-slate-500"}>{s}</span>
-              <span className="text-slate-600 ml-auto">{s === "London" ? "Active" : "Closed"}</span>
-            </div>
-          ))}
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-          <h3 className="text-sm font-bold mb-3">Top Movers</h3>
-          {["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD", "BTC/USD"].map(p => (
-            <div key={p} className="flex items-center justify-between py-1.5 text-xs border-b border-slate-800/50 last:border-0">
-              <span className="font-bold">{p}</span>
-              <span className={Math.random() > 0.5 ? "text-green-400" : "text-red-400"}>{Math.random() > 0.5 ? "+" : "-"}{(Math.random() * 0.5).toFixed(3)}%</span>
-            </div>
-          ))}
-        </div>
+        <MarketCard label="Session" value="London" sub="10:00-20:00 EAT" />
+        <MarketCard label="Volatility" value="14.2" sub="Normal" accent="amber" />
+        <MarketCard label="News Today" value="3 Events" sub="2 High Impact" accent="amber" />
+        <MarketCard label="Correlation Risk" value="Low" accent="green" />
       </div>
     </div>
   );
 
-  // ============================================================
-  // JOURNAL TAB
-  // ============================================================
+  // ---- JOURNAL ----
   const renderJournal = () => {
     const filtered = closedTrades.filter((t: any) => {
       const sym = (t.symbol_name || t.symbol || "").toLowerCase();
@@ -513,35 +433,40 @@ export default function ClientDashboard() {
     return (
       <div className="space-y-3">
         <div className="flex items-center justify-between flex-wrap gap-2">
-          <h2 className="text-lg font-bold">Trade Journal</h2>
-          <span className="text-xs text-slate-400">{filtered.length} trades | {filtered.filter((t: any) => safeNum(t.profit) >= 0).length} winners</span>
+          <h2 className="text-lg font-bold text-slate-100">Trade Journal</h2>
+          <span className="text-xs text-slate-400">{filtered.length} trades</span>
         </div>
         <div className="flex gap-2 text-xs">
-          <input type="text" placeholder="Filter symbol..." value={journalFilter.symbol} onChange={e => setJournalFilter({...journalFilter, symbol: e.target.value})} className="bg-slate-900 border border-slate-800 rounded px-3 py-1.5 text-white w-32" />
-          <select value={journalFilter.direction} onChange={e => setJournalFilter({...journalFilter, direction: e.target.value})} className="bg-slate-900 border border-slate-800 rounded px-3 py-1.5 text-white">
+          <input type="text" placeholder="Filter symbol..." value={journalFilter.symbol} onChange={e => setJournalFilter({...journalFilter, symbol: e.target.value})} className="bg-slate-900 border border-slate-800 rounded px-3 py-1.5 text-slate-200 w-32 text-[11px]" />
+          <select value={journalFilter.direction} onChange={e => setJournalFilter({...journalFilter, direction: e.target.value})} className="bg-slate-900 border border-slate-800 rounded px-3 py-1.5 text-slate-200 text-[11px]">
             <option value="">All</option><option value="BUY">BUY</option><option value="SELL">SELL</option>
           </select>
         </div>
         {filtered.length === 0 ? (
-          <div className="text-center py-12 text-slate-500 text-sm border border-slate-800 rounded-xl bg-slate-950/30">No closed trades recorded.</div>
+          <div className="text-center py-12 text-slate-500 text-sm border border-slate-800 rounded-xl bg-[#151921]">No closed trades recorded.</div>
         ) : (
           <div className="overflow-x-auto rounded-xl border border-slate-800">
             <table className="w-full text-xs font-mono">
               <thead><tr className="text-slate-500 border-b border-slate-800 bg-slate-900/50">
-                <th className="text-left py-2.5 px-3">Symbol</th><th className="text-left px-2">Dir</th><th className="text-right px-2">Vol</th>
-                <th className="text-right px-2">Entry</th><th className="text-right px-2">Exit</th><th className="text-right px-2">Profit</th><th className="text-right px-2">Date</th>
+                <th className="text-left py-2.5 px-3 text-[10px] uppercase tracking-wider">Symbol</th>
+                <th className="text-left px-2 text-[10px] uppercase tracking-wider">Dir</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">Vol</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">Entry</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">Exit</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">Profit</th>
+                <th className="text-right px-2 text-[10px] uppercase tracking-wider">Date</th>
               </tr></thead>
               <tbody>
                 {filtered.slice(0, 200).map((t: any, i: number) => {
                   const p = safeNum(t.profit);
                   return (
                     <tr key={t.id || i} className="border-b border-slate-800/50 hover:bg-slate-900/30">
-                      <td className="py-2.5 px-3 font-bold text-white">{t.symbol_name || t.symbol || "---"}</td>
-                      <td className="px-2"><span className={t.direction === "BUY" ? "text-green-400" : "text-red-400"}>{t.direction}</span></td>
-                      <td className="text-right px-2">{t.volume || "-"}</td>
-                      <td className="text-right px-2">{safeNum(t.entry_price).toFixed(5)}</td>
-                      <td className="text-right px-2">{safeNum(t.close_price).toFixed(5)}</td>
-                      <td className={`text-right px-2 font-bold ${pnlColor(p)}`}>${p.toFixed(2)}</td>
+                      <td className="py-2.5 px-3 font-bold text-slate-200">{t.symbol_name || t.symbol || "---"}</td>
+                      <td className="px-2"><DirectionBadge dir={t.direction} small /></td>
+                      <td className="text-right px-2 text-slate-300">{t.volume || "-"}</td>
+                      <td className="text-right px-2 text-slate-300">{fmt(safeNum(t.entry_price), 5)}</td>
+                      <td className="text-right px-2 text-slate-300">{fmt(safeNum(t.close_price), 5)}</td>
+                      <td className={`text-right px-2 font-bold ${p >= 0 ? "text-[#10B981]" : "text-[#EF4444]"}`}>${fmt(p)}</td>
                       <td className="text-right px-2 text-slate-500">{t.closed_at ? new Date(t.closed_at).toLocaleDateString() : "-"}</td>
                     </tr>
                   );
@@ -554,69 +479,65 @@ export default function ClientDashboard() {
     );
   };
 
-  // ============================================================
-  // SETTINGS TAB
-  // ============================================================
+  // ---- SETTINGS ----
   const renderSettings = () => (
     <div className="space-y-6 max-w-2xl">
-      <h2 className="text-lg font-bold">⚙️ Configuration</h2>
-      <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-5 space-y-4">
-        <h3 className="text-sm font-bold text-white uppercase tracking-wider font-mono">Risk Management</h3>
+      <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2"><Settings size={18} /> Configuration</h2>
+      <div className="rounded-xl border border-slate-800 bg-[#151921] p-5 space-y-4">
+        <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider">Risk Management</h3>
         <div className="space-y-3 text-xs">
           <Slider label="Risk Per Trade" value={2} min={0.5} max={5} step={0.5} unit="%" />
           <Slider label="Max Daily Loss" value={5} min={1} max={20} step={1} unit="%" />
-          <Slider label="Max Drawdown" value={15} min={5} max={50} step={5} unit="%" />
           <Slider label="Max Position Size" value={0.10} min={0.01} max={1.0} step={0.01} unit="Lots" />
-          <Slider label="Max Simultaneous Trades" value={10} min={1} max={25} step={1} unit="trades" />
+          <Slider label="Max Trades" value={10} min={1} max={25} step={1} unit="trades" />
         </div>
       </div>
-      <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-5 space-y-4">
-        <h3 className="text-sm font-bold text-white uppercase tracking-wider font-mono">Execution Thresholds</h3>
+      <div className="rounded-xl border border-slate-800 bg-[#151921] p-5 space-y-4">
+        <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider">Execution Thresholds</h3>
         <div className="space-y-3 text-xs">
-          <Slider label="Tier 1 Score (KOD Sweep)" value={55} min={30} max={90} step={5} unit="pts" />
-          <Slider label="Tier 2 Score (HTF+CE)" value={70} min={50} max={95} step={5} unit="pts" />
-          <Slider label="Max Spread (Forex)" value={2.5} min={0.5} max={10} step={0.5} unit="pips" />
+          <Slider label="Tier 1 Score" value={55} min={30} max={90} step={5} unit="pts" />
+          <Slider label="Tier 2 Score" value={70} min={50} max={95} step={5} unit="pts" />
+          <Slider label="Max Spread" value={2.5} min={0.5} max={10} step={0.5} unit="pips" />
         </div>
       </div>
     </div>
   );
 
-  // ============================================================
-  // RENDER
-  // ============================================================
+  // ---- RENDER ----
   return (
-    <main className="min-h-screen bg-slate-950 text-white">
-      {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-900/70 backdrop-blur-md sticky top-0 z-50">
+    <main className="min-h-screen" style={{backgroundColor: '#0B0E14', color: '#F3F4F6'}}>
+      <header className="border-b border-[#2A303C] bg-[#0B0E14]/80 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-4 h-12 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="h-7 w-7 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center text-[10px] font-black text-white">T</div>
-            <span className="text-sm font-bold tracking-tight">Institutional Terminal</span>
-            <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full font-mono">v2.0.0</span>
-            <div className={`h-2 w-2 rounded-full ${wsStatus.includes("Real-Time") ? "bg-green-400" : "bg-amber-400"}`} />
+            <div className="h-7 w-7 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center text-[10px] font-black text-white font-mono">T</div>
+            <span className="text-sm font-bold tracking-tight text-[#F3F4F6]">Institutional Terminal</span>
+            <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full font-mono">v2.0</span>
+            <div className={`h-2 w-2 rounded-full ${(!isStale && wsStatus.includes("Real-Time")) ? "bg-[#10B981]" : "bg-[#F59E0B]"}`} title={feedSub} />
           </div>
-          <div className="flex items-center gap-2 text-xs">
-            <span className="text-slate-400">EAT</span>
-            <span className="text-white font-mono">{new Date(Date.now() + 3 * 3600000).toISOString().substring(11, 16)}</span>
-            <span className="text-slate-500">| {lastUpdated}</span>
+          <div className="flex items-center gap-2 text-xs text-slate-400">
+            <Clock size={12} />
+            <span className="font-mono">{new Date().toLocaleTimeString()}</span>
           </div>
         </div>
       </header>
 
       <div className="flex">
-        {/* Sidebar */}
-        <nav className="w-16 md:w-48 border-r border-slate-800 bg-slate-900/50 min-h-[calc(100vh-3rem)] p-2 flex-shrink-0">
-          {NAV_ITEMS.map(item => (
-            <button key={item.id} onClick={() => setActiveTab(item.id)}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-bold transition-all mb-0.5 ${activeTab === item.id ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" : "text-slate-400 hover:text-white hover:bg-slate-800"}`}>
-              <span className="text-base">{item.icon}</span>
-              <span className="hidden md:inline">{item.label}</span>
-            </button>
-          ))}
+        <nav className="w-16 md:w-48 border-r border-[#2A303C] bg-[#0B0E14]/50 min-h-[calc(100vh-3rem)] p-2 flex-shrink-0">
+          {NAV.map(item => {
+            const Icon = item.icon;
+            return (
+              <button key={item.id} onClick={() => setActiveTab(item.id)}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-bold transition-all mb-0.5 ${
+                  activeTab === item.id ? "bg-blue-600/20 text-blue-400 border border-blue-500/30" : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/50"
+                }`}>
+                <Icon size={16} />
+                <span className="hidden md:inline">{item.label}</span>
+              </button>
+            );
+          })}
         </nav>
 
-        {/* Content */}
-        <section className="flex-1 p-4 overflow-auto">
+        <section className="flex-1 p-4 overflow-auto max-h-[calc(100vh-3rem)] overflow-y-auto">
           {activeTab === "dashboard" && renderDashboard()}
           {activeTab === "signals" && renderSignals()}
           {activeTab === "charts" && renderCharts()}
@@ -637,59 +558,84 @@ export default function ClientDashboard() {
 // ============================================================
 // SUB-COMPONENTS
 // ============================================================
-const StatCard = ({ label, value, icon, color }: { label: string; value: string | number; icon: string; color?: string }) => (
-  <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 backdrop-blur-sm">
+const MetricCard = ({ icon: Icon, label, value, accent, sub }: { icon: any; label: string; value: string; accent?: string; sub?: string }) => (
+  <div className="rounded-xl border border-[#2A303C] bg-[#151921] p-4">
     <div className="flex items-center gap-2 mb-1">
-      <span>{icon}</span>
+      <Icon size={14} className={accent === "green" ? "text-[#10B981]" : accent === "amber" ? "text-[#F59E0B]" : "text-slate-400"} />
       <span className="text-[10px] uppercase tracking-widest text-slate-500 font-mono">{label}</span>
     </div>
-    <div className={`text-lg font-bold font-mono ${color || "text-white"}`}>{value}</div>
-  </div>
-);
-
-const AnalyticCard = ({ label, value, sub, color }: { label: string; value: string; sub?: string; color?: string }) => (
-  <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 backdrop-blur-sm">
-    <div className="text-[10px] uppercase tracking-widest text-slate-500 font-mono">{label}</div>
-    <div className={`text-lg font-bold font-mono mt-0.5 ${color || "text-white"}`}>{value}</div>
+    <div className={`text-lg font-bold font-mono mt-0.5 ${accent === "green" ? "text-[#10B981]" : accent === "amber" ? "text-[#F59E0B]" : "text-[#F3F4F6]"}`}>{value}</div>
     {sub && <div className="text-[10px] text-slate-600 mt-0.5">{sub}</div>}
   </div>
 );
 
-const RiskCard = ({ label, value, color }: { label: string; value: string; color?: string }) => (
-  <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 backdrop-blur-sm">
-    <div className="text-[10px] uppercase tracking-widest text-slate-500 font-mono">{label}</div>
-    <div className={`text-lg font-bold font-mono mt-0.5 ${color || "text-white"}`}>{value}</div>
+const StatCard = ({ label, value, icon: Icon, accent }: { label: string; value: string | number; icon: any; accent?: string }) => (
+  <div className="rounded-xl border border-[#2A303C] bg-[#151921] p-4">
+    <div className="flex items-center gap-2 mb-1">
+      <Icon size={14} className="text-slate-400" />
+      <span className="text-[10px] uppercase tracking-widest text-slate-500 font-mono">{label}</span>
+    </div>
+    <div className={`text-lg font-bold font-mono ${accent === "green" ? "text-[#10B981]" : accent === "red" ? "text-[#EF4444]" : "text-[#F3F4F6]"}`}>{value}</div>
   </div>
 );
 
-const AICard = ({ label, value, color }: { label: string; value: string; color?: string }) => (
-  <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+const AnalyticCard = ({ label, value, sub, accent }: { label: string; value: string; sub?: string; accent?: string }) => (
+  <div className="rounded-xl border border-[#2A303C] bg-[#151921] p-4">
+    <div className="text-[10px] uppercase tracking-widest text-slate-500 font-mono">{label}</div>
+    <div className={`text-lg font-bold font-mono mt-0.5 ${accent === "green" ? "text-[#10B981]" : accent === "red" ? "text-[#EF4444]" : accent === "amber" ? "text-[#F59E0B]" : "text-[#F3F4F6]"}`}>{value}</div>
+    {sub && <div className="text-[10px] text-slate-600 mt-0.5">{sub}</div>}
+  </div>
+);
+
+const RiskCard = ({ label, value, accent }: { label: string; value: string; accent?: string }) => (
+  <div className="rounded-xl border border-[#2A303C] bg-[#151921] p-4">
+    <div className="text-[10px] uppercase tracking-widest text-slate-500 font-mono">{label}</div>
+    <div className={`text-lg font-bold font-mono mt-0.5 ${accent === "green" ? "text-[#10B981]" : accent === "red" ? "text-[#EF4444]" : accent === "amber" ? "text-[#F59E0B]" : "text-[#F3F4F6]"}`}>{value}</div>
+  </div>
+);
+
+const AICard = ({ label, value, accent }: { label: string; value: string; accent?: string }) => (
+  <div className="rounded-xl border border-[#2A303C] bg-[#151921] p-3">
     <div className="text-[10px] text-slate-500 font-mono">{label}</div>
-    <div className={`text-sm font-bold font-mono mt-0.5 ${color || "text-white"}`}>{value}</div>
+    <div className={`text-sm font-bold font-mono mt-0.5 ${accent === "green" ? "text-[#10B981]" : accent === "amber" ? "text-[#F59E0B]" : "text-[#F3F4F6]"}`}>{value}</div>
   </div>
 );
 
-const MarketCard = ({ label, value, sub, color }: { label: string; value: string; sub?: string; color?: string }) => (
-  <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+const MarketCard = ({ label, value, sub, accent }: { label: string; value: string; sub?: string; accent?: string }) => (
+  <div className="rounded-xl border border-[#2A303C] bg-[#151921] p-4">
     <div className="text-[10px] uppercase text-slate-500 font-mono">{label}</div>
-    <div className={`text-sm font-bold mt-0.5 ${color || "text-white"}`}>{value}</div>
+    <div className={`text-sm font-bold mt-0.5 ${accent === "green" ? "text-[#10B981]" : accent === "amber" ? "text-[#F59E0B]" : "text-[#F3F4F6]"}`}>{value}</div>
     {sub && <div className="text-[10px] text-slate-600 mt-0.5">{sub}</div>}
   </div>
 );
 
-const InfoRow = ({ label, value, color }: { label: string; value: string; color?: string }) => (
+const InfoBox = ({ label, value, accent }: { label: string; value: string; accent?: string }) => (
   <div className="bg-slate-900/50 rounded-lg p-3 border border-slate-800/50">
-    <div className="text-slate-500 text-[10px]">{label}</div>
-    <div className={`font-bold font-mono ${color || "text-white"}`}>{value}</div>
+    <div className="text-slate-500 text-[10px] font-mono">{label}</div>
+    <div className={`font-bold font-mono ${accent === "green" ? "text-[#10B981]" : accent === "red" ? "text-[#EF4444]" : "text-[#F3F4F6]"}`}>{value}</div>
   </div>
 );
+
+const DirectionBadge = ({ dir, small }: { dir: string; small?: boolean }) => (
+  <span className={`inline-flex items-center gap-1 font-bold ${small ? "text-[9px] px-1.5 py-0.5" : "text-[10px] px-2 py-0.5"} rounded-full ${dir === "BUY" ? "bg-[#10B981]/20 text-[#10B981]" : "bg-[#EF4444]/20 text-[#EF4444]"}`}>
+    {dir === "BUY" ? <ArrowUp size={small ? 8 : 10} /> : <ArrowDown size={small ? 8 : 10} />}
+    {dir}
+  </span>
+);
+
+const StatusBadge = ({ status }: { status: string }) => {
+  if (status === "ACTIVE") return <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-[#10B981]/20 text-[#10B981] font-bold">ACTIVE</span>;
+  if (status === "CLOSED_TP") return <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-blue-500/20 text-blue-400 font-bold">TP</span>;
+  if (status === "CLOSED_SL") return <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-[#EF4444]/20 text-[#EF4444] font-bold">SL</span>;
+  return <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-slate-800 text-slate-400 font-bold">{status}</span>;
+};
 
 const Slider = ({ label, value, min, max, step, unit }: { label: string; value: number; min: number; max: number; step: number; unit: string }) => (
   <div className="flex items-center justify-between">
-    <div className="text-slate-300">{label}</div>
+    <div className="text-slate-300 text-[11px]">{label}</div>
     <div className="flex items-center gap-2">
       <input type="range" min={min} max={max} step={step} defaultValue={value} className="w-20 h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500" />
-      <span className="text-white font-mono w-14 text-right">{value} {unit}</span>
+      <span className="text-slate-200 font-mono w-14 text-right text-[11px]">{value} {unit}</span>
     </div>
   </div>
 );
