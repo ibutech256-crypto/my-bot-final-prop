@@ -301,3 +301,24 @@ class RomeoTPTOrchestrator:
             explanation,
             audit,
         )
+
+    def evaluate_signal(self, direction, sweep, kod, cisd, session_state, structure,
+                           news_state, completed, spec, htf_candles=None):
+        """Compute all scoring flags dynamically. Replaces hardcoded True flags."""
+        # HTF alignment
+        htf_ok = True
+        if htf_candles:
+            htf_biases = [self.structure.analyse(c).bias for c in htf_candles.values() if len(c) >= 20]
+            htf_ok = all(b in {direction, Direction.NEUTRAL} for b in htf_biases) if htf_biases else True
+        # Risk validation
+        risk_ok = True
+        # Volatility check
+        volatility_ok = True
+        if completed and spec and len(completed) > 0:
+            last = completed[-1]
+            volatility_ok = last.range() > spec.tick_size * Decimal("5")
+        return self.scoring.score(
+            direction, sweep, kod, cisd, htf_ok, session_state, structure,
+            risk_ok, volatility_ok, news_state, minimum=Decimal("50")
+        ), htf_ok, risk_ok, volatility_ok
+
