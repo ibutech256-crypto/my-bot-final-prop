@@ -170,6 +170,11 @@ class Command(BaseCommand):
 
         while True:
             try:
+                # Auto-reconnect if MT5 drops
+                if not client.ensure_connected():
+                    import time as _t
+                    _t.sleep(5)
+                    continue
                 info = client.account_info()
                 account.balance = Decimal(str(info["balance"]))
                 account.equity = Decimal(str(info["equity"]))
@@ -798,4 +803,7 @@ class Command(BaseCommand):
                 break
             except Exception as e:
                 self.stderr.write(f"Error inside MT5 engine loop: {e}")
+                try: client.is_connected = False
+                except: pass
                 time.sleep(1)
+

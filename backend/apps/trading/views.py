@@ -1,3 +1,5 @@
+from rest_framework.views import APIView
+from rest_framework.permissions import AllowAny
 from backend.apps.common.viewsets import ActiveModelViewSet
 from backend.apps.common.permissions import ReadOnlyOrPrivileged
 from backend.apps.trading.models import BrokerProfile,BrokerSetting,TradingAccount,TradingSymbol,Watchlist,Signal,Order,OpenPosition,ClosedTrade,TradeJournal
@@ -174,3 +176,32 @@ class OpenPositionViewSet(ActiveModelViewSet): queryset=OpenPosition.objects.fil
 class ClosedTradeViewSet(ActiveModelViewSet): queryset=ClosedTrade.objects.all(); serializer_class=serializers.ClosedTradeSerializer; permission_classes=[ReadOnlyOrPrivileged]
 class TradeJournalViewSet(ActiveModelViewSet): queryset=TradeJournal.objects.all(); serializer_class=serializers.TradeJournalSerializer; permission_classes=[ReadOnlyOrPrivileged]
 
+
+class MT5HealthView(APIView):
+    """Health check for MT5 connection and system status."""
+    permission_classes = [AllowAny]
+    
+    def get(self, request):
+        data = {"mt5": "DISCONNECTED", "engine": "UNKNOWN", "positions": 0}
+        import MetaTrader5 as mt5
+        try:
+            login = int(os.getenv("MT5_LOGIN", "436005794"))
+            password = os.getenv("MT5_PASSWORD", "1234#Dt@")
+            server = os.getenv("MT5_SERVER", "Exness-MT5Trial9")
+            if mt5.initialize():
+                if mt5.login(login, password, server):
+                    info = mt5.account_info()
+                    if info:
+                        data["mt5"] = "CONNECTED"
+                        data["balance"] = info.balance
+                        data["equity"] = info.equity
+                        data["positions"] = len(mt5.positions_get() or [])
+                    mt5.shutdown()
+        except:
+            pass
+        from backend.apps.trading.models import TradingAccount
+        acct = TradingAccount.objects.first()
+        if acct:
+            data["db_balance"] = float(acct.balance)
+            data["db_equity"] = float(acct.equity)
+        return Response(data)

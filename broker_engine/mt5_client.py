@@ -30,6 +30,8 @@ class MT5Client:
         self.password = password
         self.server = server
         self.path = path
+        self.is_connected = False
+        self.reconnect_attempts = 0
         self.mt5 = importlib.import_module("MetaTrader5")
 
     def connect(self) -> None:
