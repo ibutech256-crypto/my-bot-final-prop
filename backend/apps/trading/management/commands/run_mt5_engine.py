@@ -24,6 +24,7 @@ from trading_engine.types import Candle, AccountSnapshot, SymbolSpec, Direction,
 from trading_engine.account_manager import AccountManager, TradeExecutionGate
 from trading_engine.adaptive_brain import AdaptiveBrainGate
 from trading_engine.eat_phase_engine import EATPhaseEngine
+from trading_engine.correlation_shield import check_correlation
 from telegram.bot import TelegramBotClient
 
 def _auto_load_env():
@@ -154,6 +155,12 @@ class Command(BaseCommand):
         channel_layer = get_channel_layer()
 
         self.stdout.write(f"MT5 Real-Time Polling Loop active tracking {len(visible_symbols)} Exness symbols (5s intervals)...")
+        from trading_engine.position_manager import PositionManager
+        import threading
+        pm = PositionManager()
+        pm_thread = threading.Thread(target=pm.run_loop, daemon=True)
+        pm_thread.start()
+        self.stdout.write("Position Manager daemon started")
         last_tg_heartbeat = 0.0
 
         while True:
