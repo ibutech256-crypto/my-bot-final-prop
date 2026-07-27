@@ -255,20 +255,20 @@ class Command(BaseCommand):
                     ticket = str(pos.ticket)
                     active_tickets.add(ticket)
                     sym_obj, _ = TradingSymbol.objects.get_or_create(symbol=pos.symbol)
-                    OpenPosition.objects.update_or_create(
+                    # Safe upsert: delete duplicates first, then create
+                    OpenPosition.objects.filter(account=account, broker_ticket=ticket).delete()
+                    OpenPosition.objects.create(
                         account=account,
                         broker_ticket=ticket,
-                        defaults={
-                            "symbol": sym_obj,
-                            "direction": SignalDirection.BUY if pos.type == client.mt5.ORDER_TYPE_BUY else SignalDirection.SELL,
-                            "volume": Decimal(str(pos.volume)),
-                            "entry_price": Decimal(str(pos.price_open)),
-                            "current_price": Decimal(str(pos.price_current)),
-                            "stop_loss": Decimal(str(pos.sl)) if pos.sl else None,
-                            "take_profit": Decimal(str(pos.tp)) if pos.tp else None,
-                            "unrealized_profit": Decimal(str(pos.profit)),
-                            "opened_at": datetime.fromtimestamp(pos.time, tz=timezone.utc),
-                        }
+                        symbol=sym_obj,
+                        direction=SignalDirection.BUY if pos.type == client.mt5.ORDER_TYPE_BUY else SignalDirection.SELL,
+                        volume=Decimal(str(pos.volume)),
+                        entry_price=Decimal(str(pos.price_open)),
+                        current_price=Decimal(str(pos.price_current)),
+                        stop_loss=Decimal(str(pos.sl)) if pos.sl else None,
+                        take_profit=Decimal(str(pos.tp)) if pos.tp else None,
+                        unrealized_profit=Decimal(str(pos.profit)),
+                        opened_at=datetime.fromtimestamp(pos.time, tz=timezone.utc),
                     )
 
                     # --- Automatic Quarantined Legacy Position Cleanup ---
