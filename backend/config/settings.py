@@ -47,4 +47,6 @@ STATIC_URL="/static/"; STATIC_ROOT=ROOT_DIR/"static"; MEDIA_URL="/media/"; MEDIA
 CORS_ALLOWED_ORIGINS=[x for x in os.getenv("CORS_ALLOWED_ORIGINS","http://localhost:3000").split(",") if x]
 CSRF_TRUSTED_ORIGINS=CORS_ALLOWED_ORIGINS; SECURE_CONTENT_TYPE_NOSNIFF=True; X_FRAME_OPTIONS="DENY"; SESSION_COOKIE_HTTPONLY=True
 LOG_DIR=ROOT_DIR/"logs"; LOG_DIR.mkdir(exist_ok=True)
-LOGGING={"version":1,"disable_existing_loggers":False,"handlers":{n:{"class":"logging.handlers.RotatingFileHandler","filename":LOG_DIR/f"{n}.log","maxBytes":10485760,"backupCount":10} for n in ["api","trading","broker","database","telegram","authentication","system","errors","performance"]},"loggers":{n:{"handlers":[n],"level":"INFO","propagate":False} for n in ["api","trading","broker","database","telegram","authentication","system","errors","performance"]}}
+import os as _os
+_PID=_os.getpid()
+LOGGING={"version":1,"disable_existing_loggers":False,"handlers":{n:{"class":"logging.handlers.RotatingFileHandler","filename":LOG_DIR/f"{n}.{_PID}.log","maxBytes":10485760,"backupCount":5,"delay":True,"encoding":"utf-8"} for n in ["api","trading","broker","database","telegram","authentication","system","errors","performance"]},"loggers":{n:{"handlers":[n],"level":"INFO","propagate":False} for n in ["api","trading","broker","database","telegram","authentication","system","errors","performance"]}}

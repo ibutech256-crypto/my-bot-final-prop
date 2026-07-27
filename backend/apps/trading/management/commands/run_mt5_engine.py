@@ -462,6 +462,22 @@ class Command(BaseCommand):
                                     if score.total >= Decimal("50"):
                                         recent = Signal.objects.filter(symbol=symbol_obj, direction=direction.value, strategy_name=f"Romeo TPT ({tf_enum.value})", created_at__gte=django_tz.now() - django_tz.timedelta(minutes=30)).exists()
                                         if not recent:
+                                            # --- EXECUTION ELIGIBILITY AUDIT (diagnostic logging only; no gate changes) ---
+                                            # Makes the SIGNAL SCORE vs EXECUTION ELIGIBILITY distinction explicit.
+                                            _kod_ok = bool(kod)
+                                            _qualified = score.total >= Decimal("75")
+                                            _cap_note = "" if _kod_ok else " [CAPPED AT 70: KOD=False -> scoring.py line 36]"
+                                            logger.info(
+                                                "EXEC-AUDIT %s %s | SCORE %s%s | KOD %s | QUALIFIED(>=75) %s | ELIGIBLE %s",
+                                                sym, tf_enum.value, score.total, _cap_note, _kod_ok,
+                                                "YES" if _qualified else "NO",
+                                                "YES" if (_qualified and broker_setting.enable_autotrading) else "NO",
+                                            )
+                                            if not _qualified:
+                                                logger.info(
+                                                    "EXEC-AUDIT %s %s | DECISION: WATCHLIST | REASON: score %s < 75%s",
+                                                    sym, tf_enum.value, score.total, _cap_note,
+                                                )
                                             is_high_conf = score.total >= Decimal("75")
                                             # Calculate 14-period ATR buffer (v1.9.0)
                                             atr = Decimal("0")
