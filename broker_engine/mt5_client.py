@@ -32,6 +32,8 @@ class MT5Client:
         self.path = path
         self.is_connected = False
         self.reconnect_attempts = 0
+        self.is_connected = False
+        self.reconnect_attempts = 0
         self.mt5 = importlib.import_module("MetaTrader5")
 
     def connect(self) -> None:
@@ -163,3 +165,24 @@ class MT5Client:
                 result_dict['sltp_skipped'] = True
 
             return result_dict
+    def ensure_connected(self) -> bool:
+        import time as _t
+        if getattr(self, 'is_connected', False):
+            try:
+                info = self.mt5.account_info()
+                if info is not None:
+                    self.reconnect_attempts = 0
+                    return True
+            except:
+                pass
+            self.is_connected = False
+        self.reconnect_attempts = getattr(self, 'reconnect_attempts', 0) + 1
+        delay = min(1.0 * (2 ** (self.reconnect_attempts - 1)), 30.0)
+        _t.sleep(delay)
+        if self.mt5.initialize() and self.mt5.login(self.login, self.password, self.server):
+            self.is_connected = True
+            self.reconnect_attempts = 0
+            return True
+        return False
+
+

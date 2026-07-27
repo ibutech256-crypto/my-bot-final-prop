@@ -171,11 +171,21 @@ class Command(BaseCommand):
         while True:
             try:
                 # Auto-reconnect if MT5 drops
-                if not client.ensure_connected():
-                    import time as _t
-                    _t.sleep(5)
+                # IPC-safe account_info with retry
+                info = None
+                for _retry_cnt in range(3):
+                    try:
+                        info = client.account_info()
+                        if info is not None:
+                            break
+                    except Exception:
+                        pass
+                    import time as _retry_time
+                    _retry_time.sleep(2)
+                if info is None:
+                    import time as _retry_time
+                    _retry_time.sleep(5)
                     continue
-                info = client.account_info()
                 account.balance = Decimal(str(info["balance"]))
                 account.equity = Decimal(str(info["equity"]))
                 account.margin = Decimal(str(info["margin"]))
@@ -750,20 +760,19 @@ class Command(BaseCommand):
                                                                                 broker_ticket=ticket_str
                                                                             )
 
-                                                                            OpenPosition.objects.update_or_create(
+                                                                            OpenPosition.objects.filter(account=account, broker_ticket=ticket_str).delete()
+                                                                            OpenPosition.objects.create(
                                                                                 account=account,
                                                                                 broker_ticket=ticket_str,
-                                                                                defaults={
-                                                                                    "symbol": symbol_obj,
-                                                                                    "direction": SignalDirection.BUY if sig.direction == "BUY" else SignalDirection.SELL,
-                                                                                    "volume": lot_size,
-                                                                                    "entry_price": filled_price,
-                                                                                    "current_price": filled_price,
-                                                                                    "stop_loss": exec_sl,
-                                                                                    "take_profit": exec_tp,
-                                                                                    "unrealized_profit": Decimal("0.00"),
-                                                                                    "opened_at": django_tz.now(),
-                                                                                }
+                                                                                symbol=symbol_obj,
+                                                                                direction=SignalDirection.BUY if sig.direction == "BUY" else SignalDirection.SELL,
+                                                                                volume=lot_size,
+                                                                                entry_price=filled_price,
+                                                                                current_price=filled_price,
+                                                                                stop_loss=exec_sl,
+                                                                                take_profit=exec_tp,
+                                                                                unrealized_profit=Decimal("0.00"),
+                                                                                opened_at=django_tz.now(),
                                                                             )
                                                                             Signal.objects.filter(id=sig.id).update(status="EXECUTED")
                                                                             self.stdout.write(f"TRADE EXECUTED & RECORDED: {sym} {sig.direction} @ {filled_price} (Ticket: #{ticket_str})")
