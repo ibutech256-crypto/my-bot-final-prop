@@ -1,1 +1,0 @@
-import sys; sys.path.insert(0, "."); from backend.apps.trading.management.commands.run_mt5_engine import Command; print("OK")
