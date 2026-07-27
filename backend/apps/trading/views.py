@@ -144,12 +144,33 @@ class SignalViewSet(ActiveModelViewSet):
     permission_classes=[ReadOnlyOrPrivileged]
 
     def get_queryset(self):
-        # Restrict to the last 50 signals to keep serialization lightning fast and prevent timeouts!
-        # NOTE: no slice here - slicing before DRF OrderingFilter runs raises
-        # "Cannot reorder a query once a slice has been taken." Bounding is handled
-        # by pagination / the ordering filter instead.
-        return Signal.objects.select_related("symbol", "author").filter(is_deleted=False, status__in=["WATCHLIST","ACTIVE_MONITORING","EXECUTION_READY"]).order_by("-confidence", "-created_at")
+        return Signal.objects.select_related("symbol", "author").filter(
+            is_deleted=False,
+            status__in=["WATCHLIST","ACTIVE_MONITORING","EXECUTION_READY"]
+        ).order_by("-confidence", "-created_at")
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        TF_RANK = {"H1": 3, "H4": 4, "M15": 2, "M5": 1, "M1": 0}
+        best = {}
+        for s in queryset:
+            sym = s.symbol.symbol
+            tf = s.strategy_name.split("(")[-1].rstrip(")").strip() if "(" in s.strategy_name else "M5"
+            rank = TF_RANK.get(tf, 0)
+            if sym not in best:
+                best[sym] = (s, rank)
+            else:
+                ex, ex_rank = best[sym]
+                if rank > ex_rank or (rank == ex_rank and s.confidence > ex.confidence):
+                    best[sym] = (s, rank)
+        deduped = sorted([v[0] for v in best.values()], key=lambda x: x.confidence, reverse=True)
+        page = self.paginate_queryset(list(deduped))
+        if page is not None:
+            return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        return Response(self.get_serializer(deduped, many=True).data)
+
 class OrderViewSet(ActiveModelViewSet): queryset=Order.objects.all(); serializer_class=serializers.OrderSerializer; permission_classes=[ReadOnlyOrPrivileged]
 class OpenPositionViewSet(ActiveModelViewSet): queryset=OpenPosition.objects.filter(is_deleted=False); serializer_class=serializers.OpenPositionSerializer; permission_classes=[ReadOnlyOrPrivileged]
 class ClosedTradeViewSet(ActiveModelViewSet): queryset=ClosedTrade.objects.all(); serializer_class=serializers.ClosedTradeSerializer; permission_classes=[ReadOnlyOrPrivileged]
 class TradeJournalViewSet(ActiveModelViewSet): queryset=TradeJournal.objects.all(); serializer_class=serializers.TradeJournalSerializer; permission_classes=[ReadOnlyOrPrivileged]
+
