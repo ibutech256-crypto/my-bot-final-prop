@@ -94,6 +94,11 @@ export default function ClientDashboard() {
       ws.onmessage = (ev) => {
         try {
           const d = JSON.parse(ev.data);
+          // Stamp freshness on EVERY inbound frame (incl. HEARTBEAT). The socket is the
+          // live source of truth; without this the Feed badge decays to Stale while
+          // telemetry is actually streaming normally.
+          setLastDataAt(Date.now());
+          setLastUpdated(new Date().toLocaleTimeString());
           if (d.event === "HEARTBEAT" || d.event === "PONG") { lastHeartbeat.current = Date.now(); return; }
           if (d.event === "ACCOUNT_TELEMETRY" && d.account) setAccount(p => ({ ...(p || { id:"1", account_name:"Exness MT5", currency:"USD", leverage:100, is_active:true }), account_number: d.account?.account_number ?? p?.account_number ?? "", balance: safeNum(d.account?.balance ?? p?.balance), equity: safeNum(d.account?.equity ?? p?.equity), margin: safeNum(d.account?.margin ?? p?.margin) }));
           if (d.event === "POSITIONS_SYNC" && Array.isArray(d.positions)) setPositions(d.positions);
