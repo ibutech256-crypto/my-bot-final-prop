@@ -88,158 +88,76 @@ class MT5Client:
         )
 
     def place_market_order(self, req: BrokerOrderRequest) -> dict:
-        """Two-step ECN dispatch: send with SL/TP=0, then modify. Prevents Exness Error 130."""
-        # Step 0: Validate market data freshness
-        tick = self.mt5.symbol_info_tick(req.symbol)
-        if tick is None:
-            raise RuntimeError(f"No tick data for {req.symbol}")
+            """Two-step ECN dispatch with emergency safety net."""
+            tick = self.mt5.symbol_info_tick(req.symbol)
+            if tick is None:
+                raise RuntimeError(f"No tick data for {req.symbol}")
         
-        self.last_tick_time = tick.time
-        self.last_tick_price = (tick.bid + tick.ask) / 2
+            self.last_tick_time = tick.time
+            self.last_tick_price = (tick.bid + tick.ask) / 2
 
-        # Normalize prices to symbol digits
-        spec = self.mt5.symbol_info(req.symbol)
-        digits = spec.digits if spec else 5
+            spec = self.mt5.symbol_info(req.symbol)
+            digits = spec.digits if spec else 5
 
-        typ = (
-            self.mt5.ORDER_TYPE_BUY
-            if req.direction == "BUY"
-            else self.mt5.ORDER_TYPE_SELL
-        )
-        price = round(tick.ask if req.direction == "BUY" else tick.bid, digits)
-        sl = round(float(req.stop_loss), digits) if req.stop_loss else 0.0
-        tp = round(float(req.take_profit), digits) if req.take_profit else 0.0
+            typ = (
+                self.mt5.ORDER_TYPE_BUY
+                if req.direction == "BUY"
+                else self.mt5.ORDER_TYPE_SELL
+            )
+            price = round(tick.ask if req.direction == "BUY" else tick.bid, digits)
+            sl = round(float(req.stop_loss), digits) if req.stop_loss else 0.0
+            tp = round(float(req.take_profit), digits) if req.take_profit else 0.0
 
-        # Run spread safety checks before placing order
-        self._check_spread_safety(req.symbol, price, sl if sl > 0 else None)
+            self._check_spread_safety(req.symbol, price, sl if sl > 0 else None)
 
-        # Step 1: Send order WITHOUT SL/TP (prevents Exness Error 130 - Invalid Stops)
-        result = self.mt5.order_send({
-            "action": self.mt5.TRADE_ACTION_DEAL,
-            "symbol": req.symbol,
-            "volume": float(req.volume),
-            "type": typ,
-            "price": float(price),
-            "sl": 0.0,  # DELIBERATELY ZERO
-            "tp": 0.0,  # DELIBERATELY ZERO
-            "deviation": req.deviation,
-            "type_filling": self.mt5.ORDER_FILLING_IOC,
-        })
-        if result is None:
-            raise RuntimeError(f"MT5 order_send failed: {self.mt5.last_error()}")
-
-        # Step 2: If order succeeded, immediately modify SL/TP
-        if result.retcode in (10008, 10009) and hasattr(result, 'order') and result.order:
-            modify_result = self.mt5.order_send({
-                "action": self.mt5.TRADE_ACTION_SLTP,
-                "position": result.order,
-                "sl": sl,
-                "tp": tp,
+            # Step 1: Market entry WITHOUT SL/TP (prevents Error 130)
+            result = self.mt5.order_send({
+                "action": self.mt5.TRADE_ACTION_DEAL,
+                "symbol": req.symbol,
+                "volume": float(req.volume),
+                "type": typ,
+                "price": float(price),
+                "sl": 0.0,
+                "tp": 0.0,
+                "deviation": req.deviation,
+                "type_filling": self.mt5.ORDER_FILLING_IOC,
             })
+            if result is None:
+                raise RuntimeError(f"MT5 order_send failed: {self.mt5.last_error()}")
 
-        result_dict = result._asdict()
-        logger.info(
-            f"Market order placed: {req.direction} {req.volume} {req.symbol} "
-            f"@ {price:.5f}, SL={req.stop_loss}, TP={req.take_profit}, "
-            f"ticket={result_dict.get('order', 'N/A')}"
-        )
-        return result_dict
+            result_dict = result._asdict()
+            ticket = result.order if hasattr(result, 'order') and result.order else None
 
-    def place_limit_order(self, req: BrokerOrderRequest) -> dict:
-        """Place a limit order with spread protection."""
-        tick = self.mt5.symbol_info_tick(req.symbol)
-        if tick is None:
-            raise RuntimeError(f"No tick data for {req.symbol}")
+            # Step 2: Attach SL/TP via position modify
+            if ticket and (sl > 0 or tp > 0):
+                modify_result = self.mt5.order_send({
+                    "action": self.mt5.TRADE_ACTION_SLTP,
+                    "position": ticket,
+                    "sl": sl,
+                    "tp": tp,
+                })
+                if modify_result and modify_result.retcode in (10008, 10009):
+                    result_dict['sltp_attached'] = True
+                else:
+                    # Step 3: Emergency safety net - SL/TP failed, close position
+                    err_code = modify_result.retcode if modify_result else 'NO_RESULT'
+                    result_dict['sltp_attach_error'] = err_code
+                    close_side = self.mt5.ORDER_TYPE_SELL if req.direction == 'BUY' else self.mt5.ORDER_TYPE_BUY
+                    close_price = tick.bid if req.direction == 'BUY' else tick.ask
+                    close_result = self.mt5.order_send({
+                        'action': self.mt5.TRADE_ACTION_DEAL,
+                        'symbol': req.symbol,
+                        'volume': float(req.volume),
+                        'type': close_side,
+                        'position': ticket,
+                        'price': float(close_price),
+                        'deviation': 100,
+                        'type_filling': self.mt5.ORDER_FILLING_IOC,
+                    })
+                    if close_result:
+                        result_dict['emergency_closed'] = close_result.retcode
+                        result_dict['note'] = f'Safety close: SL/TP modify returned {err_code}'
+            else:
+                result_dict['sltp_skipped'] = True
 
-        if req.price is None:
-            raise RuntimeError(f"Price is required for limit order on {req.symbol}")
-
-        typ = (
-            self.mt5.ORDER_TYPE_BUY_LIMIT
-            if req.direction == "BUY"
-            else self.mt5.ORDER_TYPE_SELL_LIMIT
-        )
-
-        # Run spread safety checks
-        self._check_spread_safety(
-            req.symbol,
-            float(req.price),
-            float(req.stop_loss) if req.stop_loss else None,
-        )
-
-        result = self.mt5.order_send({
-            "action": self.mt5.TRADE_ACTION_PENDING,
-            "symbol": req.symbol,
-            "volume": float(req.volume),
-            "type": typ,
-            "price": float(req.price),
-            "sl": float(req.stop_loss or 0),
-            "tp": float(req.take_profit or 0),
-            "deviation": req.deviation,
-            "type_filling": self.mt5.ORDER_FILLING_IOC,
-            "type_time": (self.mt5.ORDER_TIME_SPECIFIED if req.expiration else self.mt5.ORDER_TIME_GTC),
-            **({"expiration": int(req.expiration)} if req.expiration else {}),
-        })
-        if result is None:
-            raise RuntimeError(f"MT5 order_send failed: {self.mt5.last_error()}")
-
-        result_dict = result._asdict()
-        logger.info(
-            f"Limit order placed: {req.direction} {req.volume} {req.symbol} "
-            f"@ {req.price:.5f}, SL={req.stop_loss}, TP={req.take_profit}, "
-            f"ticket={result_dict.get('order', 'N/A')}"
-        )
-        return result_dict
-
-    def place_order(self, req: BrokerOrderRequest) -> dict:
-        """Route to the correct MT5 call based on req.order_type.
-
-        Previously the engine always called place_market_order() even when it had
-        explicitly built a LIMIT request (with retracement price + expiry), so the
-        CRT Sniper Limit entry silently degraded into a market fill at the ask.
-        """
-        if (req.order_type or "MARKET").upper() == "LIMIT":
-            return self.place_limit_order(req)
-        return self.place_market_order(req)
-
-    def modify_position(self, ticket: int, sl: float | None = None, tp: float | None = None) -> dict:
-        """Modify an existing position's SL/TP."""
-        result = self.mt5.order_send({
-            "action": self.mt5.TRADE_ACTION_SLTP,
-            "position": ticket,
-            "sl": float(sl or 0),
-            "tp": float(tp or 0),
-        })
-        if result is None:
-            raise RuntimeError(f"MT5 modify_position failed: {self.mt5.last_error()}")
-        return result._asdict()
-
-    def close_position(self, ticket: int, volume: float | None = None) -> dict:
-        """Close a position partially or fully."""
-        position = self.mt5.positions_get(ticket=ticket)
-        if not position:
-            raise RuntimeError(f"Position {ticket} not found")
-        position = position[0]
-
-        close_volume = volume if volume else position.volume
-        typ = (
-            self.mt5.ORDER_TYPE_SELL
-            if position.type == self.mt5.ORDER_TYPE_BUY
-            else self.mt5.ORDER_TYPE_BUY
-        )
-        tick = self.mt5.symbol_info_tick(position.symbol)
-        price = tick.bid if position.type == self.mt5.ORDER_TYPE_BUY else tick.ask
-
-        result = self.mt5.order_send({
-            "action": self.mt5.TRADE_ACTION_DEAL,
-            "symbol": position.symbol,
-            "volume": float(close_volume),
-            "type": typ,
-            "position": ticket,
-            "price": float(price),
-            "deviation": 20,
-            "type_filling": self.mt5.ORDER_FILLING_IOC,
-        })
-        if result is None:
-            raise RuntimeError(f"MT5 close_position failed: {self.mt5.last_error()}")
-        return result._asdict()
+            return result_dict

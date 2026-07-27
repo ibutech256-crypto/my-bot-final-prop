@@ -146,7 +146,7 @@ class PositionSyncEngine:
         while self.running:
             try:
                 self.sync_once()
-                time.sleep(1)
+                time.sleep(5)
             except KeyboardInterrupt:
                 self.running = False
             except:

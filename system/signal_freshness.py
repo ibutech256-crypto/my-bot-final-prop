@@ -72,7 +72,26 @@ class SignalFreshnessValidator:
                 
                 if should_archive:
                     sig.status = "EXPIRED"
-                    sig.rationale = (sig.rationale or "") + f" [ARCHIVED: {reason}]"
+            # Structured JSON log for expired signal diagnostics
+            try:
+                # Structured JSON log for expired signal diagnostics (v3.1)
+            try:
+                log_entry = {
+                    "signal_id": f"{sig.symbol.symbol}_{sig.id}",
+                    "symbol": sig.symbol.symbol,
+                    "final_state": "EXPIRED",
+                    "primary_blocking_reason": reason or "AGE_LIMIT_EXCEEDED",
+                    "confidence_score": float(sig.confidence) / 100.0,
+                    "age_minutes": round(age_minutes, 1),
+                }
+                import json as _json
+                import pathlib
+                log_path = __import__("os").path.join(__import__("os").path.dirname(__file__), "..", "logs", "expired_signals.jsonl")
+                __import__("os").makedirs(__import__("os").path.dirname(log_path), exist_ok=True)
+                with open(log_path, "a") as lf:
+                    lf.write(_json.dumps(log_entry) + "\n")
+            except:
+                pass                    sig.rationale = (sig.rationale or "") + f" [ARCHIVED: {reason}]"
                     sig.save()
                     results["archived"] += 1
                     self.archived_count += 1

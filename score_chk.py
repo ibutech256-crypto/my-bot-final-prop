@@ -1,1 +1,0 @@
-import django,os;os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.config.settings');django.setup();from backend.apps.trading.models import Signal;print('=== ACTIVE SIGNALS BY SCORE ===');[print(f'  {s.symbol} conf={s.confidence}') for s in Signal.objects.filter(status='ACTIVE').order_by('-confidence')[:10]]
