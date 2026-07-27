@@ -478,7 +478,7 @@ class Command(BaseCommand):
                                                     "EXEC-AUDIT %s %s | DECISION: WATCHLIST | REASON: score %s < 75%s",
                                                     sym, tf_enum.value, score.total, _cap_note,
                                                 )
-                                            is_high_conf = score.total >= Decimal("75")
+                                            is_high_conf = score.passed
                                             # Calculate 14-period ATR buffer (v1.9.0)
                                             atr = Decimal("0")
                                             if len(completed) >= 15:
@@ -627,7 +627,7 @@ class Command(BaseCommand):
                                                                     elif mt5_tick.bid <= 0 or mt5_tick.ask <= 0 or getattr(mt5_spec, "trade_mode", 1) == 0:
                                                                         self.stdout.write(f"EXECUTION REJECTED [{sym}]: Market closed or trading disabled for symbol")
                                                                     else:
-                                                                        lot_size = mgr.calculate_position_size(symbol_obj, sig.entry_price, sig.stop_loss)
+                                                                        lot_size = mgr.calculate_position_size(symbol_obj, sig.entry_price, sig.stop_loss, sig.confidence)
                                                                         
                                                                         # Calculate exact institutional execution price and stops buffer
                                                                         point = Decimal(str(mt5_spec.point if mt5_spec.point else "0.00001"))
@@ -709,6 +709,7 @@ class Command(BaseCommand):
                                                                                     "opened_at": django_tz.now(),
                                                                                 }
                                                                             )
+                                                                            Signal.objects.filter(id=sig.id).update(status="EXECUTED")
                                                                             self.stdout.write(f"TRADE EXECUTED & RECORDED: {sym} {sig.direction} @ {filled_price} (Ticket: #{ticket_str})")
 
                                                                             if tg_client:

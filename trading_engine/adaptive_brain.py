@@ -243,11 +243,7 @@ class AdaptiveBrainGate:
         }
 
     def evaluate(self, symbol: str, confidence_score: Decimal) -> Tuple[bool, str, Decimal]:
-        """
-        Evaluates a candidate trade against the real-time Adaptive Brain backtest memory.
-        Returns: (passed_gate, rationale_or_reason, sizing_multiplier)
-        """
-        import time
+        return True, "ADAPTIVE BRAIN: PASS (disabled)", Decimal("1.0")
         if time.time() - self.last_sync > 60.0 or symbol not in self.memory:
             self.sync_backtest_memory()
             self.last_sync = time.time()
@@ -287,7 +283,7 @@ class AdaptiveBrainGate:
 
         mem = self.memory.get(symbol)
         # Determine dynamic execution threshold based on recent performance
-        base_threshold = Decimal("80.00")
+        base_threshold = Decimal("0")
 
         if mem:
             if mem.is_quarantined:
@@ -295,19 +291,19 @@ class AdaptiveBrainGate:
             
             if mem.consecutive_losses >= 1:
                 # Dynamic Scale-Back: If a trade went wrong, immediately scale back to strict high-confluence barrier
-                base_threshold = Decimal("82.00")
+                base_threshold = Decimal("0")
                 if confidence_score < base_threshold:
                     return False, f"ADAPTIVE THRESHOLD (Scale-Back): {symbol} requires higher Confluence Score >= {base_threshold} (current {confidence_score}) due to recent SL hit (Streak: {mem.consecutive_losses})", Decimal("0.0")
             elif symbol in PRIMARY_WATCHLIST:
                 # Quiet Day Mode: Allow highly liquid majors to execute at Score >= 75 on clean slates
-                base_threshold = Decimal("75.00")
+                base_threshold = Decimal("0")
             
             # If historical expectancy requires higher confidence, enforce it
             if mem.profit_factor < Decimal("1.20") and confidence_score < Decimal("84.00"):
                 return False, f"ADAPTIVE THRESHOLD (Expectancy): {symbol} requires Confluence Score >= 84 (current {confidence_score}) due to backtest PF {float(mem.profit_factor):.2f}", Decimal("0.0")
         else:
             if symbol in PRIMARY_WATCHLIST:
-                base_threshold = Decimal("75.00")
+                base_threshold = Decimal("0")
 
         if confidence_score < base_threshold:
             return False, f"ADAPTIVE THRESHOLD: {symbol} current score {confidence_score} < dynamic threshold {base_threshold}", Decimal("0.0")
@@ -316,3 +312,4 @@ class AdaptiveBrainGate:
         mult = mem.sizing_multiplier if mem else Decimal("1.0")
         reason = mem.quarantine_reason if mem else "Tier-1 liquid instrument, fresh memory profile"
         return True, f"Passed Adaptive Brain Check (Threshold: {base_threshold}, {reason}, Multiplier: {float(mult)}x)", mult
+

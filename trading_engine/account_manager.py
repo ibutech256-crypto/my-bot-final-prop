@@ -306,15 +306,16 @@ class AccountManager:
         status = self.evaluate_status()
         if status.mode == AccountMode.GROWING_PERSONAL:
             equity = self.account.equity
-            if equity < Decimal("100"):
-                raw_lots = min_lot
-            elif equity < Decimal("250"):
-                raw_lots = min_lot * Decimal("2")
-            elif equity < Decimal("500"):
-                raw_lots = min_lot * Decimal("4")
+            risk_amount = equity * Decimal("0.005")
+            price_risk = abs(entry_price - stop_loss)
+            if price_risk > Decimal("0"):
+                cs = Decimal(str(spec.trade_contract_size if spec else symbol_obj.contract_size))
+                if cs <= Decimal("0"):
+                    cs = Decimal("100000")
+                raw_lots = risk_amount / (price_risk * cs)
             else:
-                raw_lots = (equity / Decimal("1000")) * Decimal("0.05")
-            safety_max = Decimal("0.05")
+                raw_lots = min_lot
+            safety_max = Decimal("0.20")
         else:
             price_risk = abs(entry_price - stop_loss)
             min_price_risk_floor = entry_price * Decimal("0.002")

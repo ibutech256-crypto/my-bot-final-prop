@@ -1,0 +1,3 @@
+@echo off
+cd /d C:\prop-frim-bot
+C:\prop-frim-bot\.venv\Scripts\python.exe -u backend\manage.py run_mt5_engine

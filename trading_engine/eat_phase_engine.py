@@ -105,7 +105,7 @@ class EATPhaseEngine:
                     expiration_clamp_utc=exp_clamp
                 )
             else:
-                if score >= Decimal("95.00"):
+                if score >= Decimal("70.00"):
                     return EATPhaseStatus(
                         phase_name="The 95+ Score Exception (Stock CFD Outside Core Hours)",
                         is_allowed=True,
@@ -117,7 +117,7 @@ class EATPhaseEngine:
                 return EATPhaseStatus(
                     phase_name="Stock CFD Hard Shutdown (Outside 16:30 - 23:00 EAT)",
                     is_allowed=False,
-                    reason=f"EAT PHASE GATE: Stock CFD outside US cash market window (`{eat_dt.strftime('%H:%M')} EAT`). Requires Score >= 95",
+                    reason=f"EAT PHASE GATE: Stock CFD outside US cash market window (`{eat_dt.strftime('%H:%M')} EAT`). Score >= 70 required",
                     sizing_multiplier=Decimal("0.0"),
                     is_pit_open=False,
                     expiration_clamp_utc=None
@@ -126,7 +126,7 @@ class EATPhaseEngine:
         # --- RULE 3: Pre-London Morning Window (05:00 - 10:00 EAT) ---
         if 5.0 <= eat_time_float < 10.0:
             is_morning_asset = any(a in clean_sym for a in ["XAU", "GOLD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF"])
-            if is_morning_asset or score >= Decimal("92.00"):
+            if is_morning_asset or score >= Decimal("70.00"):
                 return EATPhaseStatus(
                     phase_name="Pre-London Morning Window (05:00 - 10:00 EAT)",
                     is_allowed=True,
@@ -157,7 +157,7 @@ class EATPhaseEngine:
                     expiration_clamp_utc=None
                 )
             elif 20.0 <= eat_time_float < 23.0:
-                if score >= Decimal("88.00") or any(a in clean_sym for a in ["USDJPY", "AUDUSD", "USDCAD"]):
+                if score >= Decimal("55.00") or any(a in clean_sym for a in ["USDJPY", "AUDUSD", "USDCAD"]):
                     return EATPhaseStatus(
                         phase_name="Late FX Evening Window (20:00 - 23:00 EAT)",
                         is_allowed=True,
@@ -169,7 +169,7 @@ class EATPhaseEngine:
                 return EATPhaseStatus(
                     phase_name="FX Evening Restriction (20:00 - 23:00 EAT)",
                     is_allowed=False,
-                    reason=f"EAT PHASE GATE: FX outside core window (`{eat_dt.strftime('%H:%M')} EAT`). Requires Score >= 88",
+                    reason=f"EAT PHASE GATE: FX outside core window (`{eat_dt.strftime('%H:%M')} EAT`). Score >= 55 required",
                     sizing_multiplier=Decimal("0.0"),
                     is_pit_open=False,
                     expiration_clamp_utc=None
@@ -188,7 +188,7 @@ class EATPhaseEngine:
                     expiration_clamp_utc=None
                 )
             elif 22.0 <= eat_time_float < 23.0:
-                if score >= Decimal("90.00"):
+                if score >= Decimal("70.00"):
                     return EATPhaseStatus(
                         phase_name="Late Metals/Crypto Window (22:00 - 23:00 EAT)",
                         is_allowed=True,

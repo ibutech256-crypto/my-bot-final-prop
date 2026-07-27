@@ -1,0 +1,31 @@
+
+> build
+> next build
+
+   ??? Next.js 15.5.20
+   - Environments: .env
+
+   Creating an optimized production build ...
+ ??? Compiled successfully in 68s
+   Skipping validation of types
+   Skipping linting
+   Collecting page data ...
+   Generating static pages (0/4) ...
+   Generating static pages (1/4) 
+   Generating static pages (2/4) 
+   Generating static pages (3/4) 
+ ??? Generating static pages (4/4)
+   Finalizing page optimization ...
+   Collecting build traces ...
+
+Route (app)                                 Size  First Load JS
+??? ??? /                                    1.27 kB         104 kB
+??? ??? /_not-found                            993 B         103 kB
++ First Load JS shared by all             102 kB
+  ??? chunks/255-3981a3d1f3561bd8.js       46.2 kB
+  ??? chunks/4bd1b696-c023c6e3521b1417.js  54.2 kB
+  ??? other shared chunks (total)          2.03 kB
+
+
+???  (Static)  prerendered as static content
+

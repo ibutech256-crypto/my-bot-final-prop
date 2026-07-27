@@ -7,7 +7,7 @@ class ScoringEngine:
     weights = {
         "CRT": Decimal("12"),
         "Liquidity": Decimal("15"),
-        "KOD": Decimal("18"),  # Increased from 12
+        "KOD": Decimal("18"),
         "CISD": Decimal("12"),
         "HTF Alignment": Decimal("15"),
         "Session": Decimal("8"),
@@ -16,7 +16,6 @@ class ScoringEngine:
         "Volatility": Decimal("3"),
         "News": Decimal("2"),
     }
-
     def score(self, direction, liquidity, kod, cisd, htf, session, structure, risk_ok, volatility_ok, news, minimum=Decimal("75")):
         c = {
             "CRT": self.weights["CRT"],
@@ -31,7 +30,6 @@ class ScoringEngine:
             "News": self.weights["News"] if news.trading_allowed else Decimal("0"),
         }
         total = sum(c.values(), Decimal("0"))
-        # v2.2: Without KOD, max score is 70
         if not kod:
             total = min(total, Decimal("70"))
         passed = False

@@ -1,0 +1,6 @@
+    def evaluate_asset_phase(cls, symbol: str, score: Decimal, dt_utc: Optional[datetime] = None) -> EATPhaseStatus:
+                if score >= Decimal("70.00"):
+                        reason=f"EAT PHASE GATE: Elite setup ({score}/100 >= 95) clears out-of-hours Stock CFD exception",
+            if is_morning_asset or score >= Decimal("70.00"):
+                if score >= Decimal("55.00") or any(a in clean_sym for a in ["USDJPY", "AUDUSD", "USDCAD"]):
+                if score >= Decimal("70.00"):

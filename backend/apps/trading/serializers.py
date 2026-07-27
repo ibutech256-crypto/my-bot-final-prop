@@ -18,6 +18,14 @@ class WatchlistSerializer(serializers.ModelSerializer):
         model=Watchlist; fields="__all__"; read_only_fields=("uuid","created_at","updated_at")
 class SignalSerializer(serializers.ModelSerializer):
     symbol_name = serializers.CharField(source="symbol.symbol", read_only=True)
+    confidence_tier = serializers.SerializerMethodField()
+    def get_confidence_tier(self, obj):
+        c = float(obj.confidence)
+        if c >= 85: return "VERY_STRONG"
+        if c >= 70: return "STRONG"
+        if c >= 55: return "VALID"
+        if c >= 50: return "EMERGING"
+        return "WEAK"
     class Meta:
         model=Signal; fields="__all__"; read_only_fields=("uuid","created_at","updated_at")
 class OrderSerializer(serializers.ModelSerializer):

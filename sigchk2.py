@@ -1,0 +1,1 @@
+import django,os; os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.config.settings'); django.setup(); from backend.apps.trading.models import Signal; from django.utils import timezone; ago=timezone.now()-timezone.timedelta(hours=2); n=Signal.objects.filter(created_at__gte=ago).count(); a=Signal.objects.filter(status='ACTIVE').count(); print(f'New(2h)={n} Active={a}')

@@ -15,13 +15,17 @@ logger = logging.getLogger("trading")
 
 class ScaleOutEngine:
     """
-    Multi-Stage Scale-Out & Partial Take Profit Engine.
+    v2.2 Multi-Stage Scale-Out & Partial Take Profit Engine.
     Monitors live MT5 open positions, checks Risk-to-Reward (RR) milestones,
-    secures partial profits (50% lot reduction), and shifts SL to breakeven + spread.
+    secures partial profits (50% lot reduction), shifts SL to breakeven + spread,
+    and manages TP1/TP2/TP3 hierarchical target structure.
     """
     def __init__(self, client: MT5Client, telegram_client: Optional[TelegramBotClient] = None):
         self.client = client
         self.telegram = telegram_client
+        from backend.apps.trading.models import Signal, OpenPosition
+        self.Signal = Signal
+        self.OpenPosition = OpenPosition
 
     def evaluate_open_positions(self) -> None:
         """
@@ -107,12 +111,12 @@ class ScaleOutEngine:
                                     subscribers = list(TelegramSubscriber.objects.filter(is_deleted=False, signal_alerts=True).values_list("chat_id", flat=True))
 
                                 msg = (
-                                    f"⚡ <b>PARTIAL TP1 SECURED (50%) & SL TO BREAKEVEN</b> ⚡\n\n"
+                                    f"�s� <b>PARTIAL TP1 SECURED (50%) & SL TO BREAKEVEN</b> �s�\n\n"
                                     f"Asset: {symbol}\n"
                                     f"Volume Reduced: {close_volume} Lots (Remaining: {float(volume - close_volume)} Lots)\n"
                                     f"Closed P/L Milestone: <b>+1.5R Risk-Free</b>\n"
                                     f"Entry Price: {entry_price}\n"
-                                    f"New Stop Loss: {new_sl} (Breakeven Locked 🛡️)\n"
+                                    f"New Stop Loss: {new_sl} (Breakeven Locked dY>��,?)\n"
                                     f"Ticket: #{ticket}"
                                 )
                                 for chat_id in subscribers:
@@ -130,10 +134,10 @@ class ScaleOutEngine:
                         from backend.apps.notifications.models import TelegramSubscriber
                         subscribers = list(TelegramSubscriber.objects.filter(is_deleted=False, signal_alerts=True).values_list("chat_id", flat=True))
                         msg = (
-                            f"🎯 <b>FINAL TAKE PROFIT REACHED (1:3.0 RR)</b> 🎯\n\n"
+                            f"dYZ_ <b>FINAL TAKE PROFIT REACHED (1:3.0 RR)</b> dYZ_\n\n"
                             f"Asset: {symbol}\n"
                             f"Volume Closed: {volume} Lots (Final Run)\n"
-                            f"Profit Secured: <b>+3.0R Target Achieved</b> 🏆\n"
+                            f"Profit Secured: <b>+3.0R Target Achieved</b> dY?+\n"
                             f"Exit Price: {current_price}\n"
                             f"Ticket: #{ticket}"
                         )
@@ -198,3 +202,4 @@ class ScaleOutEngine:
             return True
         logger.error(f"ScaleOutEngine: Failed modifying SL/TP for #{ticket}: {getattr(res, 'comment', 'No Response')}")
         return False
+
