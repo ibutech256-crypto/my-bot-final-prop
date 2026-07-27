@@ -31,16 +31,12 @@ def run_mt5_engine():
         log(f"MT5 Engine exited (code {proc.returncode}), restarting in 3s...")
         time.sleep(3)
 
+# Position sync is integrated into the MT5 engine main loop.
+# Running it as a separate thread causes MT5 IPC conflicts.
 def run_position_sync():
-    """Position synchronization daemon."""
+    """Position sync disabled - integrated into MT5 engine loop."""
     while True:
-        try:
-            from trading_engine.position_sync import PositionSyncEngine
-            sync = PositionSyncEngine()
-            sync.run_loop()
-        except Exception as e:
-            log(f"Position sync error: {e}, restarting in 5s...")
-            time.sleep(5)
+        time.sleep(60)
 
 def run_health_daemon():
     """System health daemon."""

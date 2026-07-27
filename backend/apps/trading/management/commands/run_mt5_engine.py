@@ -493,7 +493,7 @@ class Command(BaseCommand):
                                     session_state = orchestrator.session.evaluate(datetime.now(timezone.utc))
                                     news_state = orchestrator.news.evaluate(datetime.now(timezone.utc), sym, [])
 
-                                    score = orchestrator.scoring.score(direction, sweep, kod, cisd, True, session_state, structure, True, True, news_state, Decimal("50"))
+                                    score, htf_ok, risk_ok, volatility_ok = orchestrator.evaluate_signal(direction, sweep, kod, cisd, session_state, structure, news_state, completed, spec)
                                     if score.total >= Decimal("50"):
                                         recent = Signal.objects.filter(symbol=symbol_obj, direction=direction.value, strategy_name=f"Romeo TPT ({tf_enum.value})", created_at__gte=django_tz.now() - django_tz.timedelta(minutes=30)).exists()
                                         if not recent:
@@ -627,6 +627,8 @@ class Command(BaseCommand):
                                                     eat_status = EATPhaseEngine.evaluate_asset_phase(sym, score.total)
                                                     if not eat_status.is_allowed:
                                                         self.stdout.write(f"EXECUTION BLOCKED BY EAT PHASE ENGINE [{sym}]: {eat_status.reason}")
+                                                        Signal.objects.filter(id=sig.id).update(status="BLOCKED_SESSION_GAP",
+                                                            rationale=Signal.objects.get(id=sig.id).rationale + f" [BLOCKED: SESSION_GAP_TIME]")
                                                         continue
 
                                                     # --- High-Impact News Blackout Engine Gate ---
@@ -654,6 +656,20 @@ class Command(BaseCommand):
                                                                 )
                                                                 if not passed_gate:
                                                                     self.stdout.write(f"EXECUTION REJECTED [{sym}]: {gate_msg}")
+                                                                    # Gate badge (v3.1)
+                                                                    badge = "SPREAD_THRESHOLD_EXCEEDED"
+                                                                    if "news" in gate_msg.lower(): badge = "NEWS_BLOCK"
+                                                                    elif "session" in gate_msg.lower(): badge = "SESSION_GAP_TIME"
+                                                                    elif "exposure" in gate_msg.lower(): badge = "MAX_EXPOSURE"
+                                                                    elif "cisd" in gate_msg.lower(): badge = "CISD_CONFIRMATION_PENDING"
+                                                                    elif "htf" in gate_msg.lower() or "alignment" in gate_msg.lower(): badge = "HTF_ALIGNMENT_WAIT"
+                                                                    Signal.objects.filter(id=sig.id).update(status=f"BLOCKED_{badge}")
+                                                                    block_reason = "SPREAD_THRESHOLD_EXCEEDED" if "spread" in gate_msg.lower() else \
+                                                                        "CISD_CONFIRMATION_PENDING" if "cisd" in gate_msg.lower() else \
+                                                                        "HTF_ALIGNMENT_WAIT" if "htf" in gate_msg.lower() or "alignment" in gate_msg.lower() else \
+                                                                        "SESSION_GAP_TIME" if "session" in gate_msg.lower() else \
+                                                                        "RISK_CAP_REACHED"
+                                                                    Signal.objects.filter(id=sig.id).update(status=f"BLOCKED_{block_reason[:20]}")
                                                                 else:
                                                                     mt5_tick = client.mt5.symbol_info_tick(sym)
                                                                     mt5_spec = client.mt5.symbol_info(sym)
