@@ -155,6 +155,11 @@ class Command(BaseCommand):
         channel_layer = get_channel_layer()
 
         self.stdout.write(f"MT5 Real-Time Polling Loop active tracking {len(visible_symbols)} Exness symbols (5s intervals)...")
+        # Scanner heartbeat metrics
+        self.scan_count = 0
+        self.last_scan_time = time.time()
+        self.last_scan_duration = 0
+        self.signals_before_scan = Signal.objects.count()
         from trading_engine.position_manager import PositionManager
         import threading
         pm = PositionManager()
@@ -172,6 +177,29 @@ class Command(BaseCommand):
                 account.save()
 
                 # --- 4-Hour Telegram System Heartbeat (Every 14,400 seconds) ---
+                # --- Scanner Heartbeat Push (Every cycle) ---
+                if channel_layer and hasattr(self, 'scan_count') and self.scan_count % 5 == 0:
+                    try:
+                        async_to_sync(channel_layer.group_send)(
+                            "trading",
+                            {
+                                "type": "event",
+                                "payload": {
+                                    "event": "SCANNER_HEARTBEAT",
+                                    "scanner": {
+                                        "scan_count": self.scan_count,
+                                        "last_scan_time": datetime.fromtimestamp(self.last_scan_time, tz=timezone.utc).isoformat() if hasattr(self, 'last_scan_time') else "",
+                                        "last_scan_duration_ms": self.last_scan_duration if hasattr(self, 'last_scan_duration') else 0,
+                                        "symbols_tracked": len(visible_symbols),
+                                        "status": "ACTIVE"
+                                    }
+                                }
+                            }
+                        )
+                    except:
+                        pass
+                
+                # --- Telegram 4-hour Heartbeat ---
                 if tg_client and (time.time() - last_tg_heartbeat >= 14400.0 or last_tg_heartbeat == 0.0):
                     last_tg_heartbeat = time.time()
                     try:

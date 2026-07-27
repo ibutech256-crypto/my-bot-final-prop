@@ -30,6 +30,28 @@ class PositionManager:
     def check_tp1(self, pos, entry, sl, tp1, tp2, tp3, direction):
         """Check if TP1 (1:1) has been hit - close 50%, move SL to breakeven."""
         current = pos.price_current
+        # Lot size guard: if 0.01, skip partial close (prevents MT5 Invalid Volume)
+        if pos.volume < 0.02:
+            # Too small to partially close - just move SL to breakeven
+            sl_mod = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": pos.symbol,
+                "position": pos.ticket,
+                "sl": float(entry_price),
+                "tp": pos.tp,
+            }
+            result = mt5.order_send(sl_mod)
+            # Update DB
+            db_pos = OpenPosition.objects.filter(broker_ticket=str(pos.ticket)).first()
+            if db_pos:
+                db_pos.stop_loss = Decimal(str(entry_price))
+                db_pos.save()
+                if db_pos.order and db_pos.order.signal:
+                    db_pos.order.signal.status = "PROTECTED"
+                    db_pos.order.signal.save()
+            return True
+        
+        # Normal case: execute partial close (lot >= 0.02)
         if direction == "BUY" and current >= float(tp1):
             return self.execute_partial_close(pos, 0.5, entry)
         elif direction == "SELL" and current <= float(tp1):

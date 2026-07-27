@@ -7,7 +7,12 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 logger = logging.getLogger("trading")
 
 
+import asyncio
+
 class TradingConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        # Enable ping/pong heartbeat every 15 seconds
+        self.ping_interval_task = None
     """WebSocket consumer with 20-second ping/pong heartbeat (v2.0.1).
     
     Sends a HEARTBEAT event every 20 seconds to prevent proxy/firewall
@@ -17,6 +22,8 @@ class TradingConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         await self.channel_layer.group_add("trading", self.channel_name)
         await self.accept()
+        # Start ping/pong heartbeat
+        self.ping_interval_task = asyncio.create_task(self._ping_loop())
         # Start background heartbeat loop
         self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info(f"WS trading connected: {self.channel_name}")
@@ -65,6 +72,8 @@ class NotificationConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         await self.channel_layer.group_add("notifications", self.channel_name)
         await self.accept()
+        # Start ping/pong heartbeat
+        self.ping_interval_task = asyncio.create_task(self._ping_loop())
         self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info(f"WS notif connected: {self.channel_name}")
 
@@ -108,6 +117,8 @@ class SystemHealthConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         await self.channel_layer.group_add("system_health", self.channel_name)
         await self.accept()
+        # Start ping/pong heartbeat
+        self.ping_interval_task = asyncio.create_task(self._ping_loop())
         self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info(f"WS syshealth connected: {self.channel_name}")
 

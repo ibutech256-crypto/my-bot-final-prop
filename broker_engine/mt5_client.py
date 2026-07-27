@@ -25,6 +25,8 @@ class MT5Client:
 
     def __init__(self, login: int, password: str, server: str, path: str | None = None):
         self.login = login
+        self.last_tick_time = 0
+        self.last_tick_price = 0
         self.password = password
         self.server = server
         self.path = path
