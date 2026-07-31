@@ -30,3 +30,11 @@ node_modules/
 
 # --- scratch ---
 *.b64
+
+# --- database snapshots / editor backups (never commit live trading data) ---
+db.sqlite3.bak-*
+*.bak
+*.v22bak
+_orphan.*
+_apitest.py
+_fixenv.py
