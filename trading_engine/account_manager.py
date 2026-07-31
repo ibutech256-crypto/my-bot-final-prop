@@ -17,35 +17,75 @@ from trading_engine.eat_phase_engine import EATPhaseEngine
 logger = logging.getLogger("trading")
 
 
-def _env_decimal(name: str, default: str) -> Decimal:
-    """Read a tunable execution-gate threshold from the environment."""
-    try:
-        return Decimal(str(os.getenv(name, default)))
-    except Exception:
-        return Decimal(default)
+from trading_engine.pipeline_trace import Reason
+from trading_engine.strategy_config import (
+    CONFIG,
+    env_decimal as _env_decimal,
+    register_reload_hook,
+)
 
-
-# --- TradeExecutionGate tunables (v2.4) ------------------------------------
+# --- TradeExecutionGate tunables (v2.5) ------------------------------------
+# All thresholds now live in trading_engine.strategy_config so exactly one
+# authoritative value exists per control and it can be retuned from .env
+# without a redeploy (Phase 6). The module-level aliases below are retained so
+# existing imports and unit tests keep working unchanged.
+#
 # Volatility floor is expressed for a 5-minute bar and scaled by sqrt(time),
 # because ATR grows roughly with the square root of the sampling interval.
 # The previous flat 0.12% was a daily-scale figure applied to M5/M15/H1 bars,
 # where a normal FX ATR is 0.02-0.09% of price -- unreachable by construction.
-ATR_RATIO_FLOOR_5M = _env_decimal("EXEC_GATE_ATR_FLOOR_5M", "0.00012")
+ATR_RATIO_FLOOR_5M = CONFIG.gate.atr_ratio_floor_5m
 
 # Upper bound only. A liquidity-sweep reversal does not need a trending market
 # -- CRT is Candle *Range* Theory -- but it should stand aside when a violent
 # one-way trend is likely to run straight through the reversal.
-ADX_MAX = _env_decimal("EXEC_GATE_ADX_MAX", "60.0")
+ADX_MAX = CONFIG.gate.adx_max
 
 # Reversal-aware RSI confirmation: fading a sweep of highs (SELL) wants an
 # extended/overbought reading, and vice versa. This is the inverse of the
 # trend-following rule that previously sat here.
-RSI_SELL_MIN = _env_decimal("EXEC_GATE_RSI_SELL_MIN", "55.0")
-RSI_BUY_MAX = _env_decimal("EXEC_GATE_RSI_BUY_MAX", "45.0")
+RSI_SELL_MIN = CONFIG.gate.rsi_sell_min
+RSI_BUY_MAX = CONFIG.gate.rsi_buy_max
 
 # Fraction of the risk distance the market may drift from the signalled entry
 # before the setup counts as a late entry.
-LATE_ENTRY_DRIFT_FRACTION = _env_decimal("EXEC_GATE_LATE_ENTRY_DRIFT", "0.35")
+LATE_ENTRY_DRIFT_FRACTION = CONFIG.gate.late_entry_drift
+
+# Score at which an otherwise-late entry is still accepted.
+LATE_ENTRY_SCORE_OVERRIDE = CONFIG.gate.late_entry_score_override
+
+# Pre-London (05:00-10:00 EAT) guard rails.
+MORNING_GUARD_MIN_SCORE = CONFIG.gate.morning_guard_min_score
+MORNING_GUARD_MAX_SPREAD_RATIO = CONFIG.gate.morning_guard_max_spread_ratio
+
+# Transaction-cost ceilings applied by the execution gate.
+MAX_SPREAD_PRICE_RATIO = CONFIG.gate.max_spread_ratio_of_price
+FOREX_MAX_SPREAD_PIPS = CONFIG.gate.forex_max_spread_pips
+
+
+@register_reload_hook
+def _refresh_from_config(cfg=CONFIG) -> None:
+    """Re-derive the gate aliases above after ``strategy_config.reload()``.
+
+    ``TradeExecutionGate`` reads these module-level names at evaluation time, so
+    without this hook an operator raising e.g. ``EXEC_GATE_ADX_MAX`` in .env
+    would see the new value in the startup banner but the gate would keep
+    rejecting against the old one.
+    """
+    global ATR_RATIO_FLOOR_5M, ADX_MAX, RSI_SELL_MIN, RSI_BUY_MAX
+    global LATE_ENTRY_DRIFT_FRACTION, LATE_ENTRY_SCORE_OVERRIDE
+    global MORNING_GUARD_MIN_SCORE, MORNING_GUARD_MAX_SPREAD_RATIO
+    global MAX_SPREAD_PRICE_RATIO, FOREX_MAX_SPREAD_PIPS
+    ATR_RATIO_FLOOR_5M = cfg.gate.atr_ratio_floor_5m
+    ADX_MAX = cfg.gate.adx_max
+    RSI_SELL_MIN = cfg.gate.rsi_sell_min
+    RSI_BUY_MAX = cfg.gate.rsi_buy_max
+    LATE_ENTRY_DRIFT_FRACTION = cfg.gate.late_entry_drift
+    LATE_ENTRY_SCORE_OVERRIDE = cfg.gate.late_entry_score_override
+    MORNING_GUARD_MIN_SCORE = cfg.gate.morning_guard_min_score
+    MORNING_GUARD_MAX_SPREAD_RATIO = cfg.gate.morning_guard_max_spread_ratio
+    MAX_SPREAD_PRICE_RATIO = cfg.gate.max_spread_ratio_of_price
+    FOREX_MAX_SPREAD_PIPS = cfg.gate.forex_max_spread_pips
 
 
 class AccountMode(Enum):
@@ -68,12 +108,29 @@ class AccountEvaluationResult:
 
 
 class TradeExecutionGate:
-    """
-    Validates institutional execution quality against strict absolute boundaries:
-    1. Spread & Transaction Cost: Max 0.10% of price (or <= 2.0 pips for Forex).
-    2. Volume & Liquidity: Tier-1 active liquidity check to prevent slippage.
-    3. Market Volatility (ATR 14): Guarantees enough daily movement to hit take-profit targets.
-    4. Trend Momentum (ADX 14 & RSI 14): ADX >= 25 and RSI > 55 (BUY) / < 45 (SELL).
+    """Final execution-quality checklist for a reversal (CRT + Turtle Soup) entry.
+
+    Checks, in order:
+
+    1. **Transaction cost** — spread as a fraction of price, with a separate
+       pip ceiling for FX (``EXEC_GATE_FOREX_MAX_SPREAD_PIPS`` /
+       ``EXEC_GATE_MAX_SPREAD_PRICE_RATIO``).
+    2. **Book liquidity** — non-zero bar volume, to avoid slippage on a
+       stagnant instrument.
+    3. **Volatility floor** — ATR(14) as a fraction of price, against a floor
+       that is *scaled to the bar size* inferred from the candle timestamps
+       (``EXEC_GATE_ATR_FLOOR_5M`` anchored at 5 minutes, scaled as sqrt(time)).
+    4. **Momentum** — ADX(14) as a *ceiling* (stand aside when the market is
+       trending too hard to fade), and RSI(14) in the *reversal* sense: a SELL
+       fades a swept high so it wants an elevated RSI, and vice versa.
+    5. **Late entry** — how far price has drifted from the signalled entry as a
+       fraction of the risk distance.
+
+    Every rejection returns ``(False, human_readable_message, meta)`` where
+    ``meta["code"]`` is a :class:`trading_engine.pipeline_trace.Reason` value.
+    The caller must use that code rather than substring-matching the message —
+    doing the latter is how "Momentum Gate rejected: RSI(14)=70.7 ..." was
+    previously persisted to the database as ``BLOCKED_RISK_CAP_REACHED``.
     """
     @staticmethod
     def _calc_rsi_14(candles: List[Candle]) -> Decimal:
@@ -180,7 +237,7 @@ class TradeExecutionGate:
         tick = client.mt5.symbol_info_tick(sym)
         spec = client.mt5.symbol_info(sym)
         if not tick or not spec:
-            return False, f"Missing real-time MT5 tick or symbol info for {sym}", {}
+            return False, f"Missing real-time MT5 tick or symbol info for {sym}", {"code": Reason.GATE_MISSING_TICK.value}
 
         ask_price = Decimal(str(tick.ask))
         bid_price = Decimal(str(tick.bid))
@@ -193,15 +250,22 @@ class TradeExecutionGate:
         if 5.0 <= eat_time_float < 10.0:
             # Message previously advertised a "92 requirement" while the code
             # tested 55. The code is authoritative; the text now matches it.
-            if sig.confidence < Decimal("55.00"):
-                return False, f"MORNING GUARD BLOCK [{sym}]: Score {sig.confidence}/100 < 55 requirement during Pre-London window (05:00-10:00 EAT)", {"score": float(sig.confidence)}
+            if sig.confidence < MORNING_GUARD_MIN_SCORE:
+                return False, (
+                    f"MORNING GUARD BLOCK [{sym}]: score {sig.confidence}/100 is below the "
+                    f"{MORNING_GUARD_MIN_SCORE} minimum required during the pre-London window "
+                    f"(05:00-10:00 EAT)"
+                ), {"code": Reason.GATE_MORNING_GUARD.value, "score": float(sig.confidence)}
 
             # The former ADX >= 28 sub-check is removed for the same reason as
             # the main momentum gate below: it demanded a trending market from
             # a range-reversal strategy. The tighter pre-London spread rule is
             # retained, as thin-book protection is genuinely timeframe-neutral.
-            if spread_ratio > Decimal("0.0005"):  # Max 0.05%
-                return False, f"MORNING GUARD BLOCK [{sym}]: Spread ({spread_ratio*100:.3f}%) > 0.05% requirement during Pre-London window", {"spread": float(spread_raw)}
+            if spread_ratio > MORNING_GUARD_MAX_SPREAD_RATIO:
+                return False, (
+                    f"MORNING GUARD BLOCK [{sym}]: spread {spread_ratio*100:.3f}% exceeds the "
+                    f"{MORNING_GUARD_MAX_SPREAD_RATIO*100:.3f}% pre-London limit"
+                ), {"code": Reason.GATE_MORNING_GUARD.value, "spread": float(spread_raw)}
 
         # 1. Bid-Ask Spread Gate (Transaction Cost): Max 0.10% or <= 2.0 pips for Forex
         if ask_price > Decimal("0"):
@@ -211,15 +275,25 @@ class TradeExecutionGate:
             if is_forex:
                 point = Decimal(str(spec.point if spec.point else "0.00001"))
                 pips = spread_raw / (point * Decimal("10") if spec.digits in [3, 5] else point)
-                if pips > Decimal("2.5") and spread_ratio > Decimal("0.0010"):
-                    return False, f"Spread Gate rejected: Forex spread ({pips:.1f} pips / {spread_ratio*100:.3f}%) exceeds the 2.5 pip / 0.10% threshold", {"spread": float(spread_raw)}
+                if pips > FOREX_MAX_SPREAD_PIPS and spread_ratio > MAX_SPREAD_PRICE_RATIO:
+                    return False, (
+                        f"Spread Gate rejected: forex spread {pips:.1f} pips / {spread_ratio*100:.3f}% "
+                        f"exceeds the {FOREX_MAX_SPREAD_PIPS} pip and "
+                        f"{MAX_SPREAD_PRICE_RATIO*100:.2f}% limits"
+                    ), {"code": Reason.GATE_SPREAD.value, "spread": float(spread_raw), "pips": float(pips)}
             else:
-                if spread_ratio > Decimal("0.0010"):  # Strictly Max 0.10% for Crypto/Stocks/Metals
-                    return False, f"Spread Gate rejected: Transaction cost ({spread_ratio*100:.3f}%) exceeds maximum 0.10% boundary", {"spread": float(spread_raw)}
+                if spread_ratio > MAX_SPREAD_PRICE_RATIO:
+                    return False, (
+                        f"Spread Gate rejected: transaction cost {spread_ratio*100:.3f}% exceeds the "
+                        f"{MAX_SPREAD_PRICE_RATIO*100:.2f}% ceiling for non-forex instruments"
+                    ), {"code": Reason.GATE_SPREAD.value, "spread": float(spread_raw)}
 
         # 2. Trading Volume & Tier-1 Liquidity Gate
         if completed_candles[-1].volume <= Decimal("0") and not any(t in sym.upper() for t in ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "BTCUSD"]):
-            return False, f"Liquidity Gate rejected: Zero or stagnant bar volume on {sym} (prevents slippage/order rejection)", {}
+            return False, (
+                f"Liquidity Gate rejected: zero or stagnant bar volume on {sym}; entering here "
+                f"invites slippage and order rejection"
+            ), {"code": Reason.GATE_LIQUIDITY_VOLUME.value}
 
         # 3. Market Volatility (ATR 14) & Trend Momentum (ADX 14 / RSI 14) Gates
         rsi_14 = TradeExecutionGate._calc_rsi_14(completed_candles)
@@ -240,7 +314,7 @@ class TradeExecutionGate:
                 return False, (
                     f"Volatility Gate rejected: ATR(14) ratio ({atr_ratio*100:.4f}%) below the "
                     f"{atr_floor*100:.4f}% floor for a {bar_minutes}-minute bar"
-                ), {"atr": float(atr_14), "bar_minutes": float(bar_minutes)}
+                ), {"code": Reason.GATE_VOLATILITY.value, "atr": float(atr_14), "bar_minutes": float(bar_minutes)}
 
         # Trend-strength ceiling, not a floor.
         # This strategy fades liquidity sweeps inside a range; requiring
@@ -252,7 +326,7 @@ class TradeExecutionGate:
             return False, (
                 f"Momentum Gate rejected: ADX(14)={adx_14:.1f} exceeds {ADX_MAX} -- market is "
                 f"trending too hard to fade a liquidity sweep"
-            ), {"adx": float(adx_14)}
+            ), {"code": Reason.GATE_MOMENTUM_ADX.value, "adx": float(adx_14)}
 
         # Reversal-aware RSI confirmation.
         # Inverted from the previous trend-following rule. A Turtle Soup SELL
@@ -264,12 +338,12 @@ class TradeExecutionGate:
             return False, (
                 f"Momentum Gate rejected: RSI(14)={rsi_14:.1f} < {RSI_SELL_MIN} -- sweep of highs "
                 f"not extended enough to fade"
-            ), {"rsi": float(rsi_14)}
+            ), {"code": Reason.GATE_MOMENTUM_RSI.value, "rsi": float(rsi_14)}
         if sig.direction == "BUY" and rsi_14 > RSI_BUY_MAX:
             return False, (
                 f"Momentum Gate rejected: RSI(14)={rsi_14:.1f} > {RSI_BUY_MAX} -- sweep of lows "
                 f"not extended enough to fade"
-            ), {"rsi": float(rsi_14)}
+            ), {"code": Reason.GATE_MOMENTUM_RSI.value, "rsi": float(rsi_14)}
 
         # 4. CRT & Late Entry Handling
         price_risk = abs(sig.entry_price - sig.stop_loss) + Decimal("1e-9")
@@ -291,15 +365,15 @@ class TradeExecutionGate:
             drift_ratio = entry_dist / price_risk
             acceptable = (
                 drift_ratio <= LATE_ENTRY_DRIFT_FRACTION * Decimal("2")
-                or sig.confidence >= Decimal("84")
+                or sig.confidence >= LATE_ENTRY_SCORE_OVERRIDE
             )
             if not acceptable:
                 return False, (
                     f"CRT Late Entry rejected: price drifted {drift_ratio:.0%} of the risk "
                     f"distance from the signalled entry (limit "
-                    f"{LATE_ENTRY_DRIFT_FRACTION * 2:.0%}) and score {sig.confidence} < 84"
-                ), {"is_late_entry": True, "entry_dist": float(entry_dist),
-                    "drift_ratio": float(drift_ratio)}
+                    f"{LATE_ENTRY_DRIFT_FRACTION * 2:.0%}) and score {sig.confidence} < {LATE_ENTRY_SCORE_OVERRIDE}"
+                ), {"code": Reason.GATE_LATE_ENTRY.value, "is_late_entry": True,
+                    "entry_dist": float(entry_dist), "drift_ratio": float(drift_ratio)}
             logger.info(
                 "Allowing CRT Late Entry on %s: drift %.0f%% of risk, score %s.",
                 sym, float(drift_ratio * 100), sig.confidence,
@@ -310,7 +384,9 @@ class TradeExecutionGate:
             f"ADX {adx_14:.1f} <= {ADX_MAX}, RSI {rsi_14:.1f}, "
             f"ATR {atr_ratio*100:.4f}% >= {atr_floor*100:.4f}% @ {bar_minutes}m)"
         ), {
+            "code": "PASSED",
             "spread": float(spread_raw),
+            "spread_ratio": float(spread_ratio),
             "momentum": True,
             "adx": float(adx_14),
             "rsi": float(rsi_14),

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from trading_engine.strategy_config import CONFIG, register_reload_hook
 from trading_engine.types import (
     Direction,
     LiquidityEvent,
@@ -47,21 +48,46 @@ from trading_engine.types import (
     StructureState,
 )
 
-# Execution tier thresholds.
-TIER_1_THRESHOLD = Decimal("55")
-TIER_2_THRESHOLD = Decimal("70")
-TIER_3_THRESHOLD = Decimal("85")
+# Execution tier thresholds. Sourced from StrategyConfig (Phase 6) so they can
+# be retuned through the environment without a redeploy; the defaults are
+# exactly the values that were previously hard-coded here.
+TIER_1_THRESHOLD = CONFIG.tiers.tier_1
+TIER_2_THRESHOLD = CONFIG.tiers.tier_2
+TIER_3_THRESHOLD = CONFIG.tiers.tier_3
 
 # Ceiling applied when the KOD displacement candle is absent. Note this sits
 # below TIER_3_THRESHOLD, so Tier 3 structurally requires KOD.
-NON_KOD_SCORE_CAP = Decimal("70")
+NON_KOD_SCORE_CAP = CONFIG.tiers.non_kod_cap
 
 # Position-size multiplier applied to the base risk unit, keyed by tier.
 TIER_RISK_MULTIPLIERS: dict[str, Decimal] = {
-    "TIER_1": Decimal("0.5"),
-    "TIER_2": Decimal("1.0"),
-    "TIER_3": Decimal("1.5"),
+    "TIER_1": CONFIG.tiers.risk_mult_1,
+    "TIER_2": CONFIG.tiers.risk_mult_2,
+    "TIER_3": CONFIG.tiers.risk_mult_3,
 }
+
+
+@register_reload_hook
+def _refresh_from_config(cfg=CONFIG) -> None:
+    """Re-derive this module's constants after ``strategy_config.reload()``.
+
+    The names above are read at call time by :meth:`ScoringEngine.evaluate` and
+    are imported by the tests, so they must track the environment rather than
+    freeze at the value that was present when this module was first imported.
+    ``TIER_RISK_MULTIPLIERS`` is updated in place because callers may hold a
+    reference to the dict itself.
+    """
+    global TIER_1_THRESHOLD, TIER_2_THRESHOLD, TIER_3_THRESHOLD, NON_KOD_SCORE_CAP
+    TIER_1_THRESHOLD = cfg.tiers.tier_1
+    TIER_2_THRESHOLD = cfg.tiers.tier_2
+    TIER_3_THRESHOLD = cfg.tiers.tier_3
+    NON_KOD_SCORE_CAP = cfg.tiers.non_kod_cap
+    TIER_RISK_MULTIPLIERS.update({
+        "TIER_1": cfg.tiers.risk_mult_1,
+        "TIER_2": cfg.tiers.risk_mult_2,
+        "TIER_3": cfg.tiers.risk_mult_3,
+    })
+
 
 # Ranking used to resolve the best tier when a setup qualifies for several.
 _TIER_RANK: dict[str, int] = {"TIER_1": 1, "TIER_2": 2, "TIER_3": 3}
@@ -163,23 +189,41 @@ class ScoringEngine:
                 tier,
                 f"{tier}: {detail} [risk x{mult}]",
                 mult,
+                "TIER_QUALIFIED",
             )
 
         # --- Not eligible: report the closest miss so the audit log is useful --
+        # ``code`` is the machine-readable counterpart consumed by the
+        # lifecycle tracer; ``reason`` stays human-readable for the log.
         if total < TIER_1_THRESHOLD:
+            code = "BELOW_TIER_1"
             reason = f"score {total} below Tier 1 minimum {TIER_1_THRESHOLD}"
         elif not sweep_ok:
+            code = "NO_LIQUIDITY_SWEEP"
             reason = f"score {total} but no valid liquidity sweep"
         elif not kod and total < TIER_2_THRESHOLD:
+            code = "KOD_NOT_CONFIRMED"
             reason = (
                 f"score {total} capped at {NON_KOD_SCORE_CAP} (KOD absent) and "
                 f"below Tier 2 threshold {TIER_2_THRESHOLD}"
             )
         elif not kod and not htf:
-            reason = f"score {total} qualifies for Tier 2 but HTF not aligned"
+            code = "HTF_CONFLICT"
+            reason = (
+                f"score {total} reaches Tier 2 on points but higher-timeframe "
+                f"bias is not aligned"
+            )
         elif not kod and not fvg_mitigated:
-            reason = f"score {total} qualifies for Tier 2 but FVG/CE not mitigated"
+            code = "FVG_CE_NOT_MITIGATED"
+            reason = (
+                f"score {total} reaches Tier 2 on points but price has not "
+                f"mitigated the 50% CE of an aligned FVG"
+            )
+        elif not htf:
+            code = "HTF_CONFLICT"
+            reason = f"score {total} with KOD confirmed but higher-timeframe bias not aligned"
         else:
+            code = "TIER_NOT_QUALIFIED"
             reason = f"score {total} did not satisfy any execution tier"
 
-        return ScoreBreakdown(total, c, False, "", reason, Decimal("0"))
+        return ScoreBreakdown(total, c, False, "", reason, Decimal("0"), code)

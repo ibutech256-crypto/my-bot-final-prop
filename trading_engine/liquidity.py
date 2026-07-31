@@ -41,17 +41,29 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from trading_engine.strategy_config import CONFIG
 from trading_engine.types import CRTRange, Candle, Direction, LiquidityEvent
 
-# How many of the most recent completed candles may host the sweep.
+# How many of the most recent completed candles may host the sweep. Kept as a
+# module constant for backwards compatibility; the effective depth comes from
+# ``LIQ_SWEEP_LOOKBACK`` via ``LiquiditySweepEngine.lookback``.
 SWEEP_LOOKBACK_OFFSETS = (-1, -2, -3)
 
 
 class LiquiditySweepEngine:
     """Detects liquidity sweeps against the CRT range and equal high/low pools."""
 
-    def __init__(self, equal_tolerance_ticks: int = 3) -> None:
-        self.equal_tolerance_ticks = equal_tolerance_ticks
+    def __init__(
+        self,
+        equal_tolerance_ticks: int | None = None,
+        lookback: int | None = None,
+    ) -> None:
+        self.equal_tolerance_ticks = (
+            equal_tolerance_ticks
+            if equal_tolerance_ticks is not None
+            else CONFIG.liquidity.equal_tolerance_ticks
+        )
+        self.lookback = lookback if lookback is not None else CONFIG.liquidity.lookback_candles
 
     # ------------------------------------------------------------------ #
     # Equal-high / equal-low pools
@@ -128,24 +140,44 @@ class LiquiditySweepEngine:
     # Detection
     # ------------------------------------------------------------------ #
 
-    def detect_sweep(
+    def detect_sweeps(
         self, candles: list[Candle], crt: CRTRange, tick_size: Decimal
-    ) -> LiquidityEvent | None:
-        """Return the most recent valid liquidity sweep, or ``None``.
+    ) -> tuple[LiquidityEvent, ...]:
+        """Every liquidity sweep inside the lookback window, newest first.
 
-        Scans the last three completed candles. A sweep is *failed* only if a
-        later completed candle closed beyond the swept level, which means the
-        market accepted the breakout instead of reversing.
+        Why this exists
+        ~~~~~~~~~~~~~~~
+        ``detect_sweep`` returns only the newest sweep. The KOD model is a
+        **two-candle** pattern — sweep candle ``N`` plus displacement candle
+        ``N+1`` — so a sweep sitting on the last completed candle can never be
+        KOD-confirmed: candle ``N+1`` has not formed yet.
+
+        Because the scan is newest-first and a candle qualifies as a sweep
+        whenever it pierces *any* equal-high/equal-low pool and closes back,
+        the newest candle wins the race most of the time. Measured live on
+        2026-07-31 across 366 symbol/timeframe evaluations, **133 of 205
+        detected sweeps (64.9%)** returned KOD reason "awaiting displacement
+        candle after sweep" — the single largest KOD blocker, larger than all
+        threshold failures combined. A perfectly valid, already-displaced
+        sweep one candle older was being masked by an unconfirmable newer one.
+
+        Returning the full candidate list lets the caller prefer a sweep that
+        already has its displacement candle, while still falling back to the
+        newest sweep so the Liquidity score component and the Tier 2 path are
+        unchanged. No threshold and no pattern definition is altered.
         """
         completed = [c for c in candles if c.completed]
         if len(completed) < 2:
-            return None
+            return ()
 
         tol = tick_size * self.equal_tolerance_ticks
         eq_h = self.equal_highs(completed[:-1], tick_size)
         eq_l = self.equal_lows(completed[:-1], tick_size)
 
-        for idx_offset in SWEEP_LOOKBACK_OFFSETS:
+        depth = max(1, int(self.lookback))
+        events: list[LiquidityEvent] = []
+
+        for idx_offset in range(-1, -depth - 1, -1):
             if abs(idx_offset) > len(completed):
                 continue
             c = completed[idx_offset]
@@ -163,7 +195,7 @@ class LiquiditySweepEngine:
                     if failed
                     else f"rejection holding (strength {float(ratio):.0%})"
                 )
-                return LiquidityEvent(
+                events.append(LiquidityEvent(
                     Direction.SELL,
                     swept_high,
                     "BUY_SIDE_LIQUIDITY_SWEEP",
@@ -172,7 +204,8 @@ class LiquiditySweepEngine:
                     f"Buy-side/Equal-high liquidity ({swept_high}) swept and "
                     f"closed back inside range; {verdict}.",
                     ratio,
-                )
+                ))
+                continue
 
             # --- Sell-side / equal-low sweep -> bullish reversal ----------
             swept_low = self._swept_low(c, crt, eq_l, tol)
@@ -184,7 +217,7 @@ class LiquiditySweepEngine:
                     if failed
                     else f"rejection holding (strength {float(ratio):.0%})"
                 )
-                return LiquidityEvent(
+                events.append(LiquidityEvent(
                     Direction.BUY,
                     swept_low,
                     "SELL_SIDE_LIQUIDITY_SWEEP",
@@ -193,6 +226,60 @@ class LiquiditySweepEngine:
                     f"Sell-side/Equal-low liquidity ({swept_low}) swept and "
                     f"closed back inside range; {verdict}.",
                     ratio,
-                )
+                ))
 
-        return None
+        return tuple(events)
+
+    def detect_sweep(
+        self, candles: list[Candle], crt: CRTRange, tick_size: Decimal
+    ) -> LiquidityEvent | None:
+        """Return the most recent valid liquidity sweep, or ``None``.
+
+        Behaviour is unchanged from the previous revision: the newest sweep in
+        the lookback window wins. Callers that need a KOD-confirmable sweep
+        should use :meth:`detect_sweeps` and
+        :func:`select_sweep_for_displacement`.
+        """
+        events = self.detect_sweeps(candles, crt, tick_size)
+        return events[0] if events else None
+
+
+def select_sweep_for_displacement(
+    events: tuple[LiquidityEvent, ...],
+    completed_count: int,
+    prefer_displaced: bool = True,
+) -> tuple[LiquidityEvent | None, str]:
+    """Pick which sweep the KOD test should be applied to.
+
+    Args:
+        events: candidates from :meth:`LiquiditySweepEngine.detect_sweeps`,
+            newest first.
+        completed_count: number of completed candles in the series.
+        prefer_displaced: when ``True`` (``KOD_SCAN_OLDER_SWEEPS``), prefer the
+            newest sweep that already has a following completed candle.
+
+    Returns:
+        ``(event, note)`` where ``note`` explains the choice for the trace log.
+        ``event`` is ``None`` only when ``events`` is empty.
+
+    The newest sweep is always returned when no older candidate has a
+    displacement candle, so the Liquidity score component and the Tier 2 (HTF +
+    FVG) execution path behave exactly as before.
+    """
+    if not events:
+        return None, "no sweep candidates"
+
+    newest = events[0]
+    if not prefer_displaced:
+        return newest, "newest sweep (older-sweep scan disabled)"
+
+    for event in events:
+        if int(event.candle_index) < completed_count - 1:
+            if event is newest:
+                return event, "newest sweep; displacement candle available"
+            return event, (
+                f"newest sweep at index {newest.candle_index} has no displacement "
+                f"candle yet; using sweep at index {event.candle_index} instead"
+            )
+
+    return newest, "newest sweep; displacement candle has not formed yet"

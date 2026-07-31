@@ -2,7 +2,7 @@ from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
 from backend.apps.common.viewsets import ActiveModelViewSet
 from backend.apps.common.permissions import ReadOnlyOrPrivileged
-from backend.apps.trading.models import BrokerProfile,BrokerSetting,TradingAccount,TradingSymbol,Watchlist,Signal,Order,OpenPosition,ClosedTrade,TradeJournal
+from backend.apps.trading.models import BrokerProfile,BrokerSetting,TradingAccount,TradingSymbol,Watchlist,Signal,SignalStatus,Order,OpenPosition,ClosedTrade,TradeJournal
 from backend.apps.trading import serializers
 class BrokerProfileViewSet(ActiveModelViewSet): queryset=BrokerProfile.objects.all(); serializer_class=serializers.BrokerProfileSerializer; permission_classes=[ReadOnlyOrPrivileged]
 class BrokerSettingViewSet(ActiveModelViewSet): queryset=BrokerSetting.objects.all(); serializer_class=serializers.BrokerSettingSerializer; permission_classes=[ReadOnlyOrPrivileged]
@@ -145,10 +145,28 @@ class SignalViewSet(ActiveModelViewSet):
     serializer_class=serializers.SignalSerializer
     permission_classes=[ReadOnlyOrPrivileged]
 
+    # Non-terminal lifecycle states the dashboard should surface.
+    #
+    # The previous list was ["WATCHLIST","ACTIVE_MONITORING","EXECUTION_READY"].
+    # Neither ACTIVE_MONITORING nor EXECUTION_READY is a value the engine has
+    # ever written, so the dashboard could only ever show WATCHLIST rows -- the
+    # 4 ACTIVE signals in the database were invisible, which is exactly the
+    # symptom that made the system look like it never executed anything. The
+    # names below are taken from SignalStatus so a future rename cannot
+    # reintroduce a silent mismatch.
+    LIVE_STATUSES = [
+        SignalStatus.WATCHLIST,
+        SignalStatus.WAITING_ENTRY,
+        SignalStatus.ACTIVE,
+        SignalStatus.SHADOW_WOULD_EXECUTE,
+        SignalStatus.EXECUTED,
+        SignalStatus.FILLED,
+    ]
+
     def get_queryset(self):
         return Signal.objects.select_related("symbol", "author").filter(
             is_deleted=False,
-            status__in=["WATCHLIST","ACTIVE_MONITORING","EXECUTION_READY"]
+            status__in=self.LIVE_STATUSES,
         ).order_by("-confidence", "-created_at")
 
     def list(self, request, *args, **kwargs):

@@ -4,17 +4,21 @@ import logging
 import os
 from decimal import Decimal
 
+from trading_engine.strategy_config import CONFIG, env_decimal as _env_decimal
 from trading_engine.types import Candle, Direction, LiquidityEvent
 
 logger = logging.getLogger("trading")
 
-
-def _env_decimal(name: str, default: str) -> Decimal:
-    """Read a tunable threshold from the environment, falling back to default."""
-    try:
-        return Decimal(str(os.getenv(name, default)))
-    except Exception:
-        return Decimal(default)
+#: Names of the five independent KOD sub-checks, in evaluation order. The
+#: funnel reports a pass rate for each one so the effect of tuning any single
+#: threshold is measurable instead of guessed.
+KOD_SUBCHECKS: tuple[str, ...] = (
+    "sweep_rejection_wick",
+    "displacement_direction",
+    "displacement_atr",
+    "displacement_volume",
+    "displacement_body_ratio",
+)
 
 
 class KODEngine:
@@ -64,21 +68,80 @@ class KODEngine:
 
     def __init__(
         self,
-        min_body_ratio: Decimal = Decimal("0.55"),
-        min_rejection_ratio: Decimal = Decimal("0.30"),
+        min_body_ratio: Decimal | None = None,
+        min_rejection_ratio: Decimal | None = None,
         atr_multiplier: Decimal | None = None,
         volume_multiplier: Decimal | None = None,
     ):
-        self.min_body_ratio = min_body_ratio
-        self.min_rejection_ratio = min_rejection_ratio
-        self.atr_multiplier = (
-            atr_multiplier if atr_multiplier is not None
-            else _env_decimal("KOD_ATR_MULTIPLIER", "1.2")
+        cfg = CONFIG.kod
+        self.min_body_ratio = min_body_ratio if min_body_ratio is not None else cfg.min_body_ratio
+        self.min_rejection_ratio = (
+            min_rejection_ratio if min_rejection_ratio is not None else cfg.min_rejection_ratio
         )
+        self.atr_multiplier = atr_multiplier if atr_multiplier is not None else cfg.atr_multiplier
         self.volume_multiplier = (
-            volume_multiplier if volume_multiplier is not None
-            else _env_decimal("KOD_VOLUME_MULTIPLIER", "1.5")
+            volume_multiplier if volume_multiplier is not None else cfg.volume_multiplier
         )
+
+    # ------------------------------------------------------------------ #
+    # Telemetry
+    # ------------------------------------------------------------------ #
+
+    def subcheck_results(
+        self,
+        candles: list[Candle],
+        liquidity_event: LiquidityEvent | None,
+        atr_14: Decimal = Decimal("0"),
+    ) -> dict[str, bool] | None:
+        """Evaluate all five sub-checks independently, for funnel telemetry.
+
+        ``confirmed_with_reason`` short-circuits on the first failure, which is
+        correct for execution but useless for diagnosis: it can only ever tell
+        you about the earliest failing check. This method evaluates every check
+        so the funnel can report a true pass rate per threshold.
+
+        Returns ``None`` when the pattern cannot be evaluated at all (no sweep,
+        insufficient history, or the displacement candle has not formed).
+        """
+        if liquidity_event is None:
+            return None
+        completed = [c for c in candles if c.completed]
+        if len(completed) < 21:
+            return None
+        sweep_idx = int(liquidity_event.candle_index)
+        if not 0 <= sweep_idx < len(completed) - 1:
+            return None
+
+        sweep_candle = completed[sweep_idx]
+        displacement = completed[sweep_idx + 1]
+        if sweep_candle.range() <= 0 or displacement.range() <= 0:
+            return None
+        if liquidity_event.direction == Direction.NEUTRAL:
+            return None
+
+        wick = (
+            sweep_candle.lower_wick()
+            if liquidity_event.direction == Direction.BUY
+            else sweep_candle.upper_wick()
+        )
+        window = completed[max(0, sweep_idx + 1 - 20):sweep_idx + 1]
+        avg_volume = (
+            sum(x.volume for x in window) / Decimal(str(len(window))) if window else Decimal("0")
+        )
+
+        return {
+            "sweep_rejection_wick": (wick / sweep_candle.range()) >= self.min_rejection_ratio,
+            "displacement_direction": displacement.direction() == liquidity_event.direction,
+            "displacement_atr": (
+                atr_14 <= 0 or displacement.body() >= self.atr_multiplier * atr_14
+            ),
+            "displacement_volume": (
+                avg_volume <= 0 or displacement.volume >= self.volume_multiplier * avg_volume
+            ),
+            "displacement_body_ratio": (
+                displacement.body() / displacement.range()
+            ) >= self.min_body_ratio,
+        }
 
     def confirmed(
         self,

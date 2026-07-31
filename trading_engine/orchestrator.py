@@ -17,6 +17,7 @@ from trading_engine.premium_discount import PremiumDiscountEngine
 from trading_engine.risk import PositionSizingEngine, RiskEngine, RiskLimits, RiskState
 from trading_engine.scoring import ScoringEngine
 from trading_engine.session import SessionEngine
+from trading_engine.strategy_config import CONFIG
 from trading_engine.trade_management import TradeManagementEngine
 from trading_engine.trend import TrendEngine
 from trading_engine.types import AccountSnapshot, Candle, Direction, SymbolSpec, Timeframe, TradeSetup
@@ -43,7 +44,10 @@ class RomeoTPTOrchestrator:
     def __init__(self, config: EngineConfig = EngineConfig()):
         self.config = config
         self.freshness = TimestampValidationEngine()
-        self.crt = CRTEngine()
+        self.crt = CRTEngine(
+            lookback=CONFIG.crt.lookback,
+            internal_ratio=CONFIG.crt.internal_ratio,
+        )
         self.liquidity = LiquiditySweepEngine()
         self.structure = MarketStructureEngine()
         self.kod = KODEngine()
@@ -143,12 +147,20 @@ class RomeoTPTOrchestrator:
         if structure.bias not in {direction, Direction.NEUTRAL}:
             return None
 
+        # Higher-timeframe alignment. When no usable higher-timeframe series is
+        # supplied the setup is only allowed through if the deployment has
+        # explicitly opted out of HTF confirmation (HTF_REQUIRE_CONFIRMATION=0).
+        # Silently treating "unknown" as "aligned" is what let every signal
+        # collect the 15-point HTF component for free.
         htf_biases = [
             self.trend.bias(v)
-            for k, v in htf_candles.items()
+            for k, v in (htf_candles or {}).items()
             if k in {Timeframe.MN1, Timeframe.W1, Timeframe.D1, Timeframe.H4, Timeframe.H1}
         ]
-        htf_ok = all(b in {direction, Direction.NEUTRAL} for b in htf_biases) if htf_biases else True
+        if htf_biases:
+            htf_ok = all(b in {direction, Direction.NEUTRAL} for b in htf_biases)
+        else:
+            htf_ok = not CONFIG.htf.require_confirmation
         if not htf_ok:
             return None
 
@@ -172,29 +184,35 @@ class RomeoTPTOrchestrator:
             return None
 
         # --- Spread Protection Gates (Module 3) ---
+        # Both controls are configuration-driven (Phase 6). The absolute pip
+        # cap is disabled by default because it was asset-class blind: it
+        # compared a raw price spread against 2.5 * pip_size where pip_size
+        # derives only from spec.digits, which made it unreachable for every
+        # index, metal and crypto instrument. It can be restored per
+        # deployment with MT5_MAX_SPREAD_PIPS.
         point = spec.tick_size
         raw_spread = Decimal(str(spec.spread_points)) * point
-
-        # Max Absolute Spread Gate: Reject entries if spread > 2.5 pips (25 points)
         pip_size = point * Decimal("10") if spec.digits in [3, 5] else point
-        if raw_spread > Decimal("2.5") * pip_size:
+
+        if CONFIG.spread.max_pips is not None and raw_spread > CONFIG.spread.max_pips * pip_size:
             return None
 
-        # Stop Loss: strictly beyond sweep extreme + (1.5x ATR + Current Spread Buffer)
+        # Stop Loss: strictly beyond sweep extreme + (ATR multiple + spread buffer)
         spread_buffer = raw_spread
-        atr_buffer = Decimal("1.5") * atr + spread_buffer
+        atr_buffer = CONFIG.risk.stop_atr_multiplier * atr + spread_buffer
         if direction == Direction.BUY:
             stop_loss = min(last.low, crt_range.low) - atr_buffer
         else:
             stop_loss = max(last.high, crt_range.high) + atr_buffer
 
-        # Spread-to-Target Ratio: Current spread must not exceed 15% of Entry-to-SL distance
+        # Spread-to-Target Ratio: spread must not exceed the configured
+        # fraction of the entry-to-stop distance.
         risk_dist = abs(last.close - stop_loss)
-        if risk_dist > 0 and raw_spread / risk_dist > Decimal("0.15"):
+        if risk_dist > 0 and raw_spread / risk_dist > CONFIG.spread.max_risk_ratio:
             return None
 
         # --- Scoring & Tiered Execution Gate (Module 2) ---
-        volatility_ok = last.range() > spec.tick_size * Decimal("5")
+        volatility_ok = last.range() > spec.tick_size * CONFIG.risk.min_volatility_ticks
         # Tier 2 requires price to have mitigated the 50% CE of an aligned FVG.
         fvg_mitigated = any(
             g.direction == direction and g.state in {"MITIGATED", "FILLED"} for g in gaps
@@ -328,25 +346,87 @@ class RomeoTPTOrchestrator:
         )
 
     def evaluate_signal(self, direction, sweep, kod, cisd, session_state, structure,
-                           news_state, completed, spec, htf_candles=None, atr=None):
+                        news_state, completed, spec, htf_candles=None, atr=None,
+                        htf_result=None):
         """Compute all scoring flags dynamically. Replaces hardcoded True flags.
 
         Args:
+            direction: The trade direction. For CRT + Turtle Soup this is the
+                *sweep* direction (fade the pool that was just taken), not the
+                prevailing structural bias.
             atr: 14-period ATR. When supplied, KOD is re-evaluated with the
                 Module 3 dynamic displacement filter active. The caller
                 previously invoked ``kod.confirmed(completed, sweep)`` with no
-                ATR, which left the 1.8x/1.2x displacement gate dormant.
+                ATR, which left the displacement gate dormant.
+            htf_candles: optional ``{Timeframe: [Candle]}`` mapping. Legacy
+                path, retained for callers that already hold the series.
+            htf_result: an :class:`trading_engine.htf_bias.HTFBiasResult`
+                produced by :class:`~trading_engine.htf_bias.HTFBiasEngine`.
+                This is the preferred input; it carries the per-timeframe bias
+                and a status that distinguishes "aligned" from "could not be
+                determined".
+
+        Module 1 fix — HTF alignment is no longer assumed
+        -------------------------------------------------
+        The previous body opened with ``htf_ok = True`` and only overrode it
+        ``if htf_candles:``. ``run_mt5_engine`` never passed ``htf_candles``,
+        so the override never ran and **every signal in the platform's history
+        received the full 15-point HTF Alignment component unconditionally**
+        (verified: 460 of 460 signals over six hours). Tier 2's "HTF aligned"
+        requirement and Tier 3's ``htf`` leg were therefore vacuous.
+
+        ``htf_ok`` now starts as ``False`` and is only set ``True`` by positive
+        evidence. When no HTF information is supplied at all the result is
+        ``DATA_UNAVAILABLE`` — explicitly not alignment — so a caller that
+        forgets to wire the HTF engine loses 15 points rather than silently
+        gaining them. That is the fail-safe direction for a trading system.
         """
-        # HTF alignment
-        htf_ok = True
-        if htf_candles:
-            htf_biases = [self.structure.analyse(c).bias for c in htf_candles.values() if len(c) >= 20]
-            htf_ok = all(b in {direction, Direction.NEUTRAL} for b in htf_biases) if htf_biases else True
+        from trading_engine.htf_bias import HTFBiasResult, HTFStatus
+
+        # --- Module 1: higher-timeframe alignment, evaluated for real -------
+        if htf_result is not None:
+            htf_ok = bool(htf_result.aligned)
+            resolved_htf = htf_result
+        elif htf_candles:
+            htf_biases = {
+                getattr(key, "value", str(key)): self.trend.bias(series)
+                for key, series in htf_candles.items()
+                if len([c for c in series if c.completed]) >= 20
+            }
+            if htf_biases:
+                conflicting = tuple(
+                    tf for tf, bias in sorted(htf_biases.items())
+                    if bias not in {direction, Direction.NEUTRAL}
+                )
+                htf_ok = not conflicting
+                resolved_htf = HTFBiasResult(
+                    status=HTFStatus.ALIGNED if htf_ok else HTFStatus.CONFLICT,
+                    aligned=htf_ok,
+                    biases={tf: b.value for tf, b in htf_biases.items()},
+                    conflicting=conflicting,
+                    detail="resolved from caller-supplied higher-timeframe candles",
+                )
+            else:
+                htf_ok = False
+                resolved_htf = HTFBiasResult(
+                    status=HTFStatus.DATA_UNAVAILABLE,
+                    aligned=False,
+                    detail="supplied higher-timeframe series were too short to evaluate",
+                )
+        else:
+            htf_ok = False
+            resolved_htf = HTFBiasResult(
+                status=HTFStatus.DATA_UNAVAILABLE,
+                aligned=False,
+                detail="no higher-timeframe data supplied to evaluate_signal",
+            )
 
         # Module 3: re-evaluate KOD with the ATR displacement filter engaged.
         kod_reason = "ATR not supplied; displacement filter skipped"
         if atr is not None and atr > 0 and sweep is not None:
             kod, kod_reason = self.kod.confirmed_with_reason(completed, sweep, atr)
+        elif sweep is None:
+            kod, kod_reason = False, "no liquidity event"
 
         # Module 2 Tier 2 confirmation.
         fvg_mitigated = self.fvg_ce_mitigated(direction, completed)
@@ -357,7 +437,7 @@ class RomeoTPTOrchestrator:
         volatility_ok = True
         if completed and spec and len(completed) > 0:
             last = completed[-1]
-            volatility_ok = last.range() > spec.tick_size * Decimal("5")
+            volatility_ok = last.range() > spec.tick_size * CONFIG.risk.min_volatility_ticks
 
         score = self.scoring.score(
             direction, sweep, kod, cisd, htf_ok, session_state, structure,
@@ -366,5 +446,9 @@ class RomeoTPTOrchestrator:
         )
         self.last_kod_reason = kod_reason
         self.last_fvg_mitigated = fvg_mitigated
+        self.last_htf_result = resolved_htf
+        self.last_kod_subchecks = self.kod.subcheck_results(
+            completed, sweep, atr if atr is not None else Decimal("0")
+        )
         return score, htf_ok, risk_ok, volatility_ok
 

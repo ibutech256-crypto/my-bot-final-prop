@@ -160,6 +160,12 @@ class ScoreBreakdown:
     # (Tier 1 = 0.5, Tier 2 = 1.0, Tier 3 = 1.5); 0 when the setup did not pass.
     # Defaulted so existing positional constructions keep working unchanged.
     risk_multiplier: Decimal = Decimal("1.0")
+    # Machine-readable counterpart of ``gate_reason``, drawn from
+    # trading_engine.pipeline_trace.Reason. Lets the lifecycle tracer classify
+    # a non-qualifying score without pattern-matching on English prose, which
+    # is how "Momentum Gate rejected: RSI..." previously ended up recorded in
+    # the database as "BLOCKED_RISK_CAP_REACHED".
+    gate_code: str = ""
 
 @dataclass(frozen=True)
 class PositionSize:
