@@ -1,0 +1,1 @@
+import os;os.environ["DJANGO_SETTINGS_MODULE"]="backend.config.settings";import django;django.setup();from backend.apps.trading.models import OpenPosition;c=OpenPosition.objects.count();OpenPosition.objects.all().delete();print(f"Cleaned {c} records")

@@ -1,53 +1,32 @@
-# Python
+# --- secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- local database (should never be in VCS) ---
+db.sqlite3
+db.sqlite3-shm
+db.sqlite3-wal
+celerybeat-schedule*
+
+# --- python ---
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-.eggs/
-dist/
-build/
-*.egg
-
-# Environment
-.env
 .venv/
-venv/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Project - logs
+# --- logs / runtime ---
 logs/
 *.log
+*.bak_agent
+*.bak2
+*.bak3
+*.retired
 
-# Project - database
-db.sqlite3
-db.sqlite3-*
-
-# Project - legacy patches (archived temp scripts)
-legacy_patches/
-
-# Project - celery
-celerybeat-schedule.dat
-celerybeat-schedule.dir
-celerybeat-schedule.bak
-
-# Project - local test files
-*.b64
-build_result.txt
-clean_b64.txt
-0
-Decimal
-
-# Next.js
-frontend/.next/
-frontend/out/
+# --- node / next ---
 node_modules/
 .next/
+
+# --- scratch ---
+*.b64
