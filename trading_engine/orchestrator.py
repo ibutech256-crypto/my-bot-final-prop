@@ -195,6 +195,10 @@ class RomeoTPTOrchestrator:
 
         # --- Scoring & Tiered Execution Gate (Module 2) ---
         volatility_ok = last.range() > spec.tick_size * Decimal("5")
+        # Tier 2 requires price to have mitigated the 50% CE of an aligned FVG.
+        fvg_mitigated = any(
+            g.direction == direction and g.state in {"MITIGATED", "FILLED"} for g in gaps
+        )
         score = self.scoring.score(
             direction,
             sweep,
@@ -207,6 +211,7 @@ class RomeoTPTOrchestrator:
             volatility_ok,
             news_state,
             self.config.minimum_score,
+            fvg_mitigated=fvg_mitigated,
         )
 
         if not score.passed:
@@ -222,17 +227,17 @@ class RomeoTPTOrchestrator:
         entry_type_2 = entry_options.get("entry_type_2", last.close)
         entry_type_3 = entry_options.get("entry_type_3", fvg_ce)
 
-        # Select best entry based on score tier:
-        # - Tier 2 (score >= 70): Prefer FVG CE limit entry (entry_type_3)
-        # - Tier 1 (score >= 55): Use market entry on KOD close (entry_type_2)
-        if score.total >= Decimal("70") and htf_ok:
-            # Tier 2: HTF alignment + FVG/CE mitigation - prefer limit at FVG CE
+        # Select the entry based on the tier that actually authorised the trade:
+        # - TIER_2: HTF alignment + FVG/CE mitigation -> limit at the FVG 50% CE
+        # - TIER_1: liquidity sweep + KOD displacement -> market on KOD close
+        if score.tier == "TIER_2":
             selected_entry = entry_type_3
             entry_reason = "limit_fvg_ce"
+            order_type = "LIMIT"
         else:
-            # Tier 1: Liquidity Sweep + KOD - use market or limit at sweep
             selected_entry = entry_type_2
             entry_reason = "market_kod_close"
+            order_type = "MARKET"
 
         plan = self.tm.build_plan(direction, selected_entry, stop_loss)
         size = self.sizer.calculate(account, spec, selected_entry, stop_loss, self.config.risk_limits.risk_pct)
@@ -248,8 +253,8 @@ class RomeoTPTOrchestrator:
         rr = abs(plan.tp2 - selected_entry) / abs(selected_entry - stop_loss)
         target = str(crt_range.target_high if direction == Direction.BUY else crt_range.target_low)
 
-        # Determine execution tier for audit
-        execution_tier = "TIER_1" if score.total < Decimal("70") else "TIER_2"
+        # Execution tier as resolved by the scoring gate itself.
+        execution_tier = score.tier or "TIER_1"
 
         explanation = self.explainer.explain(
             direction, sweep, score, structure, session_state,
@@ -275,7 +280,10 @@ class RomeoTPTOrchestrator:
             "news_blockers": news_state.blocking_events,
             "execution_tier": execution_tier,
             "entry_type": entry_reason,
+            "order_type": order_type,
             "selected_entry": str(selected_entry),
+            "fvg_ce_mitigated": fvg_mitigated,
+            "gate_reason": score.gate_reason,
             "atr_14": str(atr),
             "raw_spread": str(raw_spread),
         }
@@ -302,14 +310,47 @@ class RomeoTPTOrchestrator:
             audit,
         )
 
+    def fvg_ce_mitigated(self, direction, completed: list[Candle]) -> bool:
+        """True when price has traded into the 50% consequent encroachment of a
+        fair value gap aligned with ``direction``.
+
+        This is the Tier 2 confirmation required by Module 2. ``FairValueGapEngine``
+        marks a zone MITIGATED once the latest candle straddles its CE midpoint,
+        and FILLED once the whole gap has been consumed; both count as mitigation.
+        """
+        try:
+            gaps = self.fvg.detect(completed)
+        except Exception:
+            return False
+        return any(
+            g.direction == direction and g.state in {"MITIGATED", "FILLED"}
+            for g in gaps
+        )
+
     def evaluate_signal(self, direction, sweep, kod, cisd, session_state, structure,
-                           news_state, completed, spec, htf_candles=None):
-        """Compute all scoring flags dynamically. Replaces hardcoded True flags."""
+                           news_state, completed, spec, htf_candles=None, atr=None):
+        """Compute all scoring flags dynamically. Replaces hardcoded True flags.
+
+        Args:
+            atr: 14-period ATR. When supplied, KOD is re-evaluated with the
+                Module 3 dynamic displacement filter active. The caller
+                previously invoked ``kod.confirmed(completed, sweep)`` with no
+                ATR, which left the 1.8x/1.2x displacement gate dormant.
+        """
         # HTF alignment
         htf_ok = True
         if htf_candles:
             htf_biases = [self.structure.analyse(c).bias for c in htf_candles.values() if len(c) >= 20]
             htf_ok = all(b in {direction, Direction.NEUTRAL} for b in htf_biases) if htf_biases else True
+
+        # Module 3: re-evaluate KOD with the ATR displacement filter engaged.
+        kod_reason = "ATR not supplied; displacement filter skipped"
+        if atr is not None and atr > 0 and sweep is not None:
+            kod, kod_reason = self.kod.confirmed_with_reason(completed, sweep, atr)
+
+        # Module 2 Tier 2 confirmation.
+        fvg_mitigated = self.fvg_ce_mitigated(direction, completed)
+
         # Risk validation
         risk_ok = True
         # Volatility check
@@ -317,8 +358,13 @@ class RomeoTPTOrchestrator:
         if completed and spec and len(completed) > 0:
             last = completed[-1]
             volatility_ok = last.range() > spec.tick_size * Decimal("5")
-        return self.scoring.score(
+
+        score = self.scoring.score(
             direction, sweep, kod, cisd, htf_ok, session_state, structure,
-            risk_ok, volatility_ok, news_state, minimum=Decimal("50")
-        ), htf_ok, risk_ok, volatility_ok
+            risk_ok, volatility_ok, news_state, minimum=Decimal("50"),
+            fvg_mitigated=fvg_mitigated,
+        )
+        self.last_kod_reason = kod_reason
+        self.last_fvg_mitigated = fvg_mitigated
+        return score, htf_ok, risk_ok, volatility_ok
 

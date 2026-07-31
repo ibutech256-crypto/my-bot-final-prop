@@ -4,7 +4,7 @@ import MetaTrader5 as mt5
 from decimal import Decimal
 from datetime import datetime, timezone
 from django.utils import timezone as django_tz
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
 
 from broker_engine.mt5_client import MT5Client
 from backend.apps.trading.models import TradingAccount, TradingSymbol, Order, OpenPosition
@@ -31,8 +31,18 @@ class ScaleOutEngine:
         """
         Scans all live open positions in MT5 terminal and applies scale-out rules.
         """
-        # Ensure we are connected
-        if not self.client.connect():
+        # Ensure we are connected.
+        # MT5Client.connect() used to return None on success, so `not None` was
+        # always True and this method aborted on every single cycle -- stop
+        # losses were never moved to breakeven at TP1. connect() now returns a
+        # bool; ensure_connected() is used here so a healthy session is not
+        # torn down and re-initialised on every pass.
+        try:
+            if not self.client.ensure_connected():
+                logger.warning("ScaleOut: MT5 not connected, skipping cycle")
+                return
+        except Exception as exc:
+            logger.warning("ScaleOut: connection check failed: %s", exc)
             return
 
         positions = self.client.mt5.positions_get() or ()

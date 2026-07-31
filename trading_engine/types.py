@@ -143,6 +143,12 @@ class ScoreBreakdown:
     total: Decimal
     components: dict[str, Decimal]
     passed: bool
+    # Which execution tier authorised this setup: "TIER_1", "TIER_2" or "" when
+    # the setup did not qualify. Defaulted so existing 3-arg positional
+    # constructions elsewhere in the codebase keep working unchanged.
+    tier: str = ""
+    # Human-readable explanation of the gating decision, for the EXEC-AUDIT log.
+    gate_reason: str = ""
 
 @dataclass(frozen=True)
 class PositionSize:

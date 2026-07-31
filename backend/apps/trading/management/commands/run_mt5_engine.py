@@ -508,37 +508,35 @@ class Command(BaseCommand):
                                     session_state = orchestrator.session.evaluate(datetime.now(timezone.utc))
                                     news_state = orchestrator.news.evaluate(datetime.now(timezone.utc), sym, [])
 
-                                    score, htf_ok, risk_ok, volatility_ok = orchestrator.evaluate_signal(direction, sweep, kod, cisd, session_state, structure, news_state, completed, spec)
+                                    # Module 3: ATR(14) is computed BEFORE scoring so the dynamic KOD
+                                    # displacement filter is actually engaged. It used to be calculated
+                                    # ~25 lines later, after the gate had already been decided.
+                                    atr = orchestrator._calculate_atr_14(completed)
+                                    score, htf_ok, risk_ok, volatility_ok = orchestrator.evaluate_signal(direction, sweep, kod, cisd, session_state, structure, news_state, completed, spec, atr=atr)
+                                    kod = "KOD confirmed" in getattr(orchestrator, "last_kod_reason", "")
                                     if score.total >= Decimal("50"):
                                         recent = Signal.objects.filter(symbol=symbol_obj, direction=direction.value, strategy_name=f"Romeo TPT ({tf_enum.value})", created_at__gte=django_tz.now() - django_tz.timedelta(minutes=30)).exists()
                                         if not recent:
                                             # --- EXECUTION ELIGIBILITY AUDIT (diagnostic logging only; no gate changes) ---
                                             # Makes the SIGNAL SCORE vs EXECUTION ELIGIBILITY distinction explicit.
                                             _kod_ok = bool(kod)
-                                            _qualified = score.total >= Decimal("75")
-                                            _cap_note = "" if _kod_ok else " [CAPPED AT 70: KOD=False -> scoring.py line 36]"
+                                            _qualified = bool(score.passed)
+                                            _tier = score.tier or "NONE"
                                             logger.info(
-                                                "EXEC-AUDIT %s %s | SCORE %s%s | KOD %s | QUALIFIED(>=75) %s | ELIGIBLE %s",
-                                                sym, tf_enum.value, score.total, _cap_note, _kod_ok,
-                                                "YES" if _qualified else "NO",
+                                                "EXEC-AUDIT %s %s | SCORE %s | TIER %s | KOD %s | FVG_CE %s | HTF %s | ELIGIBLE %s | %s",
+                                                sym, tf_enum.value, score.total, _tier, _kod_ok,
+                                                getattr(orchestrator, "last_fvg_mitigated", False), htf_ok,
                                                 "YES" if (_qualified and broker_setting.enable_autotrading) else "NO",
+                                                score.gate_reason,
                                             )
                                             if not _qualified:
                                                 logger.info(
-                                                    "EXEC-AUDIT %s %s | DECISION: WATCHLIST | REASON: score %s < 75%s",
-                                                    sym, tf_enum.value, score.total, _cap_note,
+                                                    "EXEC-AUDIT %s %s | DECISION: WATCHLIST | REASON: %s | KOD: %s",
+                                                    sym, tf_enum.value, score.gate_reason,
+                                                    getattr(orchestrator, "last_kod_reason", "n/a"),
                                                 )
                                             is_high_conf = score.passed
-                                            # Calculate 14-period ATR buffer (v1.9.0)
-                                            atr = Decimal("0")
-                                            if len(completed) >= 15:
-                                                tr_list = []
-                                                for i in range(1, len(completed)):
-                                                    c = completed[i]
-                                                    prev = completed[i-1]
-                                                    tr = max(c.high - c.low, abs(c.high - prev.close), abs(c.low - prev.close))
-                                                    tr_list.append(tr)
-                                                atr = sum(tr_list[-14:]) / Decimal("14")
+                                            # ATR(14) already computed above, before the scoring gate.
 
                                             # Spread Protection Gates & Spread-to-Target Ratio (v1.9.2)
                                             # FIX: mt5_spec was referenced here but only assigned ~124 lines later
@@ -546,6 +544,7 @@ class Command(BaseCommand):
                                             # UnboundLocalError and no signal ever reached scoring.
                                             mt5_spec = client.mt5.symbol_info(sym)
                                             if not mt5_spec:
+                                                logger.info("EXEC-AUDIT %s %s | DROPPED: no MT5 symbol spec", sym, tf_enum.value)
                                                 continue
                                             point = Decimal(str(mt5_spec.point if mt5_spec.point else "0.00001"))
                                             raw_spread = Decimal(str(mt5_spec.spread if mt5_spec.spread else "5")) * point
@@ -553,6 +552,10 @@ class Command(BaseCommand):
                                             
                                             # Reject if spread exceeds 2.5 pips
                                             if raw_spread > Decimal("2.5") * pip_size:
+                                                logger.info(
+                                                    "EXEC-AUDIT %s %s | DROPPED: spread %.6f > 2.5 pips (%.6f) [Module 3 absolute cap]",
+                                                    sym, tf_enum.value, float(raw_spread), float(Decimal("2.5") * pip_size),
+                                                )
                                                 continue
 
                                             # Stop Loss: strictly beyond sweep extreme + (1.5x ATR + Current Spread Buffer)
@@ -562,6 +565,10 @@ class Command(BaseCommand):
                                             # Spread-to-Target Ratio check
                                             calc_risk = abs(completed[-1].close - calc_sl)
                                             if calc_risk > 0 and raw_spread / calc_risk > Decimal("0.15"):
+                                                logger.info(
+                                                    "EXEC-AUDIT %s %s | DROPPED: spread/risk %.2f%% > 15%% (spread %.6f, risk %.6f) [Module 3 ratio cap]",
+                                                    sym, tf_enum.value, float(raw_spread / calc_risk * 100), float(raw_spread), float(calc_risk),
+                                                )
                                                 continue
 
                                             calc_tp = completed[-1].close + calc_risk * Decimal("2.0") if direction.value == "BUY" else completed[-1].close - calc_risk * Decimal("2.0")
@@ -707,24 +714,63 @@ class Command(BaseCommand):
                                                                             min_lot = Decimal(str(mt5_spec.volume_min if mt5_spec.volume_min else "0.01"))
                                                                             lot_size = max(min_lot, (lot_size * eat_status.sizing_multiplier / lot_step).to_integral_value(rounding=ROUND_DOWN) * lot_step)
 
-                                                                        # CRT Sniper Limit Retracement Calculation (1.5 to 2.0 pips deep into M5/M15 candle body)
+                                                                        # --- Module 4: three-way entry selection -------------------------
+                                                                        # TIER_1 (sweep + KOD)          -> MARKET order on the KOD candle close
+                                                                        # TIER_2 (HTF + FVG/CE)         -> LIMIT order at the FVG 50% CE
+                                                                        # Fallback for a TIER_2 setup with no usable CE is a sniper limit a
+                                                                        # couple of pips inside the candle body, which is the previous
+                                                                        # behaviour and is retained so execution never stalls.
+                                                                        _exec_tier = getattr(score, "tier", "") or "TIER_1"
                                                                         pips_retracement = point * Decimal("18") if digits in [3, 5] else point * Decimal("2")
                                                                         
+                                                                        _ce_price = None
+                                                                        if _exec_tier == "TIER_2":
+                                                                            try:
+                                                                                _aligned = [
+                                                                                    g for g in orchestrator.fvg.detect(completed)
+                                                                                    if g.direction == direction and g.state in {"VALID", "MITIGATED"}
+                                                                                ]
+                                                                                if _aligned:
+                                                                                    _ce = (_aligned[-1].low + _aligned[-1].high) / Decimal("2")
+                                                                                    _ref = Decimal(str(mt5_tick.ask if sig.direction == "BUY" else mt5_tick.bid))
+                                                                                    # A limit must rest on the correct side of the market and
+                                                                                    # stay within a sane distance, else the order never fills.
+                                                                                    _ok_side = _ce < _ref if sig.direction == "BUY" else _ce > _ref
+                                                                                    if _ok_side and abs(_ref - _ce) <= pips_retracement * Decimal("12"):
+                                                                                        _ce_price = _ce
+                                                                            except Exception as _ce_err:
+                                                                                logger.warning("FVG CE calculation failed for %s: %s", sym, _ce_err)
+                                                                        
+                                                                        if _exec_tier == "TIER_1":
+                                                                            _order_type = "MARKET"
+                                                                            _entry_label = "MARKET on KOD close"
+                                                                            exec_price = round(Decimal(str(mt5_tick.ask if sig.direction == "BUY" else mt5_tick.bid)), digits)
+                                                                        else:
+                                                                            _order_type = "LIMIT"
+                                                                            if _ce_price is not None:
+                                                                                _entry_label = "LIMIT at FVG 50% CE"
+                                                                                exec_price = round(_ce_price, digits)
+                                                                            else:
+                                                                                _entry_label = "LIMIT sniper retracement"
+                                                                                exec_price = round(
+                                                                                    (Decimal(str(mt5_tick.ask)) - pips_retracement) if sig.direction == "BUY"
+                                                                                    else (Decimal(str(mt5_tick.bid)) + pips_retracement), digits)
+                                                                        
                                                                         if sig.direction == "BUY":
-                                                                            exec_price = round(Decimal(str(mt5_tick.ask)) - pips_retracement, digits)
                                                                             exec_sl = round(min(sig.stop_loss, exec_price - min_stop_dist), digits)
                                                                             exec_tp = round(max(sig.take_profit, exec_price + min_stop_dist * Decimal("2")), digits)
                                                                         else:
-                                                                            exec_price = round(Decimal(str(mt5_tick.bid)) + pips_retracement, digits)
                                                                             exec_sl = round(max(sig.stop_loss, exec_price + min_stop_dist), digits)
                                                                             exec_tp = round(min(sig.take_profit, exec_price - min_stop_dist * Decimal("2")), digits)
+                                                                        
+                                                                        # Pending limits expire in 4 minutes; market orders do not expire.
+                                                                        exp_ts = None
+                                                                        if _order_type == "LIMIT":
+                                                                            exp_ts = int((datetime.now(timezone.utc) + timedelta(minutes=4)).timestamp())
+                                                                            if eat_status.expiration_clamp_utc is not None:
+                                                                                exp_ts = min(exp_ts, eat_status.expiration_clamp_utc)
 
-                                                                        # Strict Micro-Expiration (4 Minutes or EAT Phase expiration clamp)
-                                                                        exp_ts = int((datetime.now(timezone.utc) + timedelta(minutes=4)).timestamp())
-                                                                        if eat_status.expiration_clamp_utc is not None:
-                                                                            exp_ts = min(exp_ts, eat_status.expiration_clamp_utc)
-
-                                                                        self.stdout.write(f"EXECUTING CRT SNIPER LIMIT [{sym}]: Mode={eval_result.mode.value}, Phase={eat_status.phase_name}, Lots={lot_size}, Direction={sig.direction}, LimitEntry={exec_price}, ExpIn=4min")
+                                                                        self.stdout.write(f"EXECUTING {_exec_tier} [{sym}]: {_entry_label}, Mode={eval_result.mode.value}, Phase={eat_status.phase_name}, Lots={lot_size}, Direction={sig.direction}, Entry={exec_price}, SL={exec_sl}, TP={exec_tp}")
 
                                                                         req = BrokerOrderRequest(
                                                                             symbol=sym,
@@ -734,7 +780,7 @@ class Command(BaseCommand):
                                                                             stop_loss=exec_sl,
                                                                             take_profit=exec_tp,
                                                                             deviation=broker_setting.order_deviation_points,
-                                                                            order_type="LIMIT",
+                                                            order_type=_order_type,
                                                                             expiration=exp_ts,
                                                                             is_pit_open=eat_status.is_pit_open
                                                                         )
@@ -749,7 +795,7 @@ class Command(BaseCommand):
                                                                                 signal=sig,
                                                                                 symbol=symbol_obj,
                                                                                 direction=sig.direction,
-                                                                                order_type="MARKET",
+                                order_type=_order_type,
                                                                                 status="FILLED",
                                                                                 requested_volume=lot_size,
                                                                                 filled_volume=lot_size,

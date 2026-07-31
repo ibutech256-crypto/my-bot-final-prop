@@ -1,156 +1,103 @@
-import json
+"""WebSocket consumers for the live trading telemetry stream.
+
+v2.0.2 fix
+----------
+The previous revision called ``asyncio.create_task(self._ping_loop())`` inside
+``connect()`` but ``_ping_loop`` was never defined on any of these classes.
+Every websocket handshake therefore raised
+
+    AttributeError: 'TradingConsumer' object has no attribute '_ping_loop'
+
+inside ``websocket_connect``, so Daphne accepted the socket and then instantly
+tore it down (WSCONNECT immediately followed by WSDISCONNECT).  The browser saw
+three failed sockets in a row and fell back to the 5-second HTTP polling path,
+which is why the dashboard badge read "Polling (HTTP 5s)".
+
+``TradingConsumer`` also carried a duplicated ``connect()`` stub that shadowed
+the real one and left the class docstring stranded in the middle of the body.
+
+This revision keeps a single keepalive task per consumer, defines it properly,
+and cancels it cleanly on disconnect.
+"""
+
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
+
 from channels.generic.websocket import AsyncWebsocketConsumer
 
 logger = logging.getLogger("trading")
 
+# Seconds between server-initiated HEARTBEAT frames. Kept below the common
+# 30s idle timeout used by proxies/NAT so the socket is never reaped.
+HEARTBEAT_INTERVAL = 15
 
-import asyncio
 
-class TradingConsumer(AsyncWebsocketConsumer):
-    async def connect(self):
-        # Enable ping/pong heartbeat every 15 seconds
-        self.ping_interval_task = None
-    """WebSocket consumer with 20-second ping/pong heartbeat (v2.0.1).
-    
-    Sends a HEARTBEAT event every 20 seconds to prevent proxy/firewall
-    idle timeouts and allow the frontend to detect stale connections.
-    """
+class _HeartbeatConsumer(AsyncWebsocketConsumer):
+    """Shared group-subscribe + heartbeat behaviour."""
+
+    group_name: str = ""
+    log_label: str = "ws"
 
     async def connect(self):
-        await self.channel_layer.group_add("trading", self.channel_name)
+        self.heartbeat_task = None
+        await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
-        # Start ping/pong heartbeat
-        self.ping_interval_task = asyncio.create_task(self._ping_loop())
-        # Start background heartbeat loop
         self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.info(f"WS trading connected: {self.channel_name}")
+        logger.info("WS %s connected: %s", self.log_label, self.channel_name)
 
     async def disconnect(self, code):
-        await self.channel_layer.group_discard("trading", self.channel_name)
-        if hasattr(self, 'heartbeat_task'):
-            self.heartbeat_task.cancel()
-        logger.info(f"WS trading disconnected ({code}): {self.channel_name}")
+        task = getattr(self, "heartbeat_task", None)
+        if task is not None:
+            task.cancel()
+        await self.channel_layer.group_discard(self.group_name, self.channel_name)
+        logger.info("WS %s disconnected (%s): %s", self.log_label, code, self.channel_name)
 
     async def receive(self, text_data=None, bytes_data=None):
-        """Handle incoming messages. Respond to PING with PONG."""
-        if text_data:
-            try:
-                data = json.loads(text_data)
-                if data.get("event") == "PING":
-                    await self.send(text_data=json.dumps({
-                        "event": "PONG",
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }))
-            except json.JSONDecodeError:
-                pass
-
-    async def event(self, event):
-        """Receive channel-layer event and push to WebSocket."""
-        await self.send(text_data=json.dumps(event.get("payload", {})))
-
-    async def _heartbeat_loop(self):
-        """Send a heartbeat ping every 20 seconds to prevent idle disconnects."""
+        """Reply to a client PING with a PONG so the browser can measure RTT."""
+        if not text_data:
+            return
         try:
-            while True:
-                await asyncio.sleep(20)
-                await self.send(text_data=json.dumps({
-                    "event": "HEARTBEAT",
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(f"Trading heartbeat error: {e}")
-
-
-class NotificationConsumer(AsyncWebsocketConsumer):
-    """WebSocket consumer with 20-second heartbeat."""
-
-    async def connect(self):
-        await self.channel_layer.group_add("notifications", self.channel_name)
-        await self.accept()
-        # Start ping/pong heartbeat
-        self.ping_interval_task = asyncio.create_task(self._ping_loop())
-        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.info(f"WS notif connected: {self.channel_name}")
-
-    async def disconnect(self, code):
-        await self.channel_layer.group_discard("notifications", self.channel_name)
-        if hasattr(self, 'heartbeat_task'):
-            self.heartbeat_task.cancel()
-
-    async def receive(self, text_data=None, bytes_data=None):
-        if text_data:
-            try:
-                data = json.loads(text_data)
-                if data.get("event") == "PING":
-                    await self.send(text_data=json.dumps({
-                        "event": "PONG",
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }))
-            except json.JSONDecodeError:
-                pass
+            data = json.loads(text_data)
+        except json.JSONDecodeError:
+            return
+        if data.get("event") == "PING":
+            await self.send(text_data=json.dumps({
+                "event": "PONG",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }))
 
     async def event(self, event):
+        """Fan out a channel-layer event to this socket."""
         await self.send(text_data=json.dumps(event.get("payload", {})))
 
     async def _heartbeat_loop(self):
         try:
             while True:
-                await asyncio.sleep(20)
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
                 await self.send(text_data=json.dumps({
                     "event": "HEARTBEAT",
-                    "timestamp": datetime.now(timezone.utc).isoformat()
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }))
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            logger.warning(f"Notif heartbeat error: {e}")
+        except Exception as exc:  # socket already gone, nothing to recover
+            logger.warning("%s heartbeat stopped: %s", self.log_label, exc)
 
 
-class SystemHealthConsumer(AsyncWebsocketConsumer):
-    """WebSocket consumer with 20-second heartbeat."""
+class TradingConsumer(_HeartbeatConsumer):
+    """Live account / position / signal / telemetry stream (group: ``trading``)."""
 
-    async def connect(self):
-        await self.channel_layer.group_add("system_health", self.channel_name)
-        await self.accept()
-        # Start ping/pong heartbeat
-        self.ping_interval_task = asyncio.create_task(self._ping_loop())
-        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.info(f"WS syshealth connected: {self.channel_name}")
+    group_name = "trading"
+    log_label = "trading"
 
-    async def disconnect(self, code):
-        await self.channel_layer.group_discard("system_health", self.channel_name)
-        if hasattr(self, 'heartbeat_task'):
-            self.heartbeat_task.cancel()
 
-    async def receive(self, text_data=None, bytes_data=None):
-        if text_data:
-            try:
-                data = json.loads(text_data)
-                if data.get("event") == "PING":
-                    await self.send(text_data=json.dumps({
-                        "event": "PONG",
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }))
-            except json.JSONDecodeError:
-                pass
+class NotificationConsumer(_HeartbeatConsumer):
+    group_name = "notifications"
+    log_label = "notif"
 
-    async def event(self, event):
-        await self.send(text_data=json.dumps(event.get("payload", {})))
 
-    async def _heartbeat_loop(self):
-        try:
-            while True:
-                await asyncio.sleep(20)
-                await self.send(text_data=json.dumps({
-                    "event": "HEARTBEAT",
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(f"SysHealth heartbeat error: {e}")
+class SystemHealthConsumer(_HeartbeatConsumer):
+    group_name = "system_health"
+    log_label = "syshealth"
