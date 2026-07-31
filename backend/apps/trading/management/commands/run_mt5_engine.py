@@ -4,7 +4,7 @@ if hasattr(sys.stdout, "reconfigure"): sys.stdout.reconfigure(encoding="utf-8", 
 if hasattr(sys.stderr, "reconfigure"): sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import time
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from dotenv import load_dotenv
 import logging
@@ -25,7 +25,20 @@ from trading_engine.account_manager import AccountManager, TradeExecutionGate
 from trading_engine.adaptive_brain import AdaptiveBrainGate
 from trading_engine.eat_phase_engine import EATPhaseEngine
 from trading_engine.correlation_shield import check_correlation
+from trading_engine.scoring import tier_risk_multiplier
 from telegram.bot import TelegramBotClient
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    """Interpret an environment variable as a boolean switch."""
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Shadow mode: run the complete decision funnel against live market data and
+# log every trade that *would* be placed, without transmitting any order.
+# Enabled with SHADOW_MODE=1 in the environment. Verified at startup so the
+# operating mode is unambiguous in the logs.
+SHADOW_MODE = _env_flag("SHADOW_MODE", "0")
 
 def _auto_load_env():
     load_dotenv()
@@ -154,6 +167,13 @@ class Command(BaseCommand):
 
         channel_layer = get_channel_layer()
 
+        _mode_banner = (
+            "SHADOW MODE -- signals scored and sized, NO orders transmitted"
+            if SHADOW_MODE else
+            "LIVE MODE -- orders will be transmitted to the broker"
+        )
+        self.stdout.write(f"*** {_mode_banner} ***")
+        logger.warning("Engine starting in %s", _mode_banner)
         self.stdout.write(f"MT5 Real-Time Polling Loop active tracking {len(visible_symbols)} Exness symbols (5s intervals)...")
         # Scanner heartbeat metrics
         self.scan_count = 0
@@ -529,6 +549,16 @@ class Command(BaseCommand):
                                                 "YES" if (_qualified and broker_setting.enable_autotrading) else "NO",
                                                 score.gate_reason,
                                             )
+                                            # Full component breakdown so any score can be reconciled
+                                            # to the exact confluences that produced it (Module 8).
+                                            logger.info(
+                                                "EXEC-AUDIT %s %s | BREAKDOWN %s | sweep=%s failed=%s rejection=%.0f%%",
+                                                sym, tf_enum.value,
+                                                " ".join(f"{k}={v}" for k, v in score.components.items()),
+                                                getattr(sweep, "kind", "none"),
+                                                getattr(sweep, "failed", None),
+                                                float(getattr(sweep, "rejection_ratio", 0) or 0) * 100,
+                                            )
                                             if not _qualified:
                                                 logger.info(
                                                     "EXEC-AUDIT %s %s | DECISION: WATCHLIST | REASON: %s | KOD: %s",
@@ -550,13 +580,23 @@ class Command(BaseCommand):
                                             raw_spread = Decimal(str(mt5_spec.spread if mt5_spec.spread else "5")) * point
                                             pip_size = point * Decimal("10") if mt5_spec.digits in [3, 5] else point
                                             
-                                            # Reject if spread exceeds 2.5 pips
-                                            if raw_spread > Decimal("2.5") * pip_size:
-                                                logger.info(
-                                                    "EXEC-AUDIT %s %s | DROPPED: spread %.6f > 2.5 pips (%.6f) [Module 3 absolute cap]",
-                                                    sym, tf_enum.value, float(raw_spread), float(Decimal("2.5") * pip_size),
-                                                )
-                                                continue
+                                            # NOTE (v2.4): the former "reject if spread > 2.5 pips"
+                                            # absolute cap was removed here. It was asset-class blind --
+                                            # it compared a raw price spread against 2.5 * pip_size, where
+                                            # pip_size derives only from spec.digits -- so for every
+                                            # non-FX instrument the bar was unreachable by construction
+                                            # (measured live: XAGUSD 3.0 pips, XAUUSD 24, DE30 16, US30 35,
+                                            # JP225 71, HK50 148, BTCUSD 1000). It accounted for 3,212 of
+                                            # 3,243 rejections (99.0%) in the audit log and permanently
+                                            # blocked all indices, metals and crypto.
+                                            #
+                                            # The spread-to-risk ratio gate immediately below is retained
+                                            # as the sole spread control: what matters economically is the
+                                            # spread relative to the stop distance being risked, which
+                                            # self-scales across asset classes. An absolute cap can still
+                                            # be re-imposed per deployment via MT5_MAX_SPREAD_PIPS, which
+                                            # broker_engine.mt5_client honours on every order.
+                                            spread_pips = (raw_spread / pip_size) if pip_size > 0 else Decimal("0")
 
                                             # Stop Loss: strictly beyond sweep extreme + (1.5x ATR + Current Spread Buffer)
                                             atr_buffer = Decimal("1.5") * atr + raw_spread
@@ -566,8 +606,10 @@ class Command(BaseCommand):
                                             calc_risk = abs(completed[-1].close - calc_sl)
                                             if calc_risk > 0 and raw_spread / calc_risk > Decimal("0.15"):
                                                 logger.info(
-                                                    "EXEC-AUDIT %s %s | DROPPED: spread/risk %.2f%% > 15%% (spread %.6f, risk %.6f) [Module 3 ratio cap]",
-                                                    sym, tf_enum.value, float(raw_spread / calc_risk * 100), float(raw_spread), float(calc_risk),
+                                                    "EXEC-AUDIT %s %s | DROPPED: spread/risk %.2f%% > 15%% "
+                                                    "(spread %.6f = %.2f pips, risk %.6f) [Module 3 ratio cap]",
+                                                    sym, tf_enum.value, float(raw_spread / calc_risk * 100),
+                                                    float(raw_spread), float(spread_pips), float(calc_risk),
                                                 )
                                                 continue
 
@@ -714,8 +756,24 @@ class Command(BaseCommand):
                                                                             min_lot = Decimal(str(mt5_spec.volume_min if mt5_spec.volume_min else "0.01"))
                                                                             lot_size = max(min_lot, (lot_size * eat_status.sizing_multiplier / lot_step).to_integral_value(rounding=ROUND_DOWN) * lot_step)
 
+                                                                        # --- Tier-scaled position sizing (Module 6) ----------------------
+                                                                        # Conviction drives size: Tier 1 (>=55) risks half a unit,
+                                                                        # Tier 2 (>=70) a full unit, Tier 3 (>=85) one and a half.
+                                                                        _risk_mult = tier_risk_multiplier(getattr(score, "tier", ""))
+                                                                        if _risk_mult != Decimal("1.0") and _risk_mult > 0:
+                                                                            _lot_step = Decimal(str(mt5_spec.volume_step if mt5_spec.volume_step else "0.01"))
+                                                                            _min_lot = Decimal(str(mt5_spec.volume_min if mt5_spec.volume_min else "0.01"))
+                                                                            _max_lot = Decimal(str(mt5_spec.volume_max if mt5_spec.volume_max else "100"))
+                                                                            _scaled = (lot_size * _risk_mult / _lot_step).to_integral_value(rounding=ROUND_DOWN) * _lot_step
+                                                                            lot_size = max(_min_lot, min(_scaled, _max_lot))
+                                                                            self.stdout.write(
+                                                                                f"TIER SIZING [{sym}]: {getattr(score, 'tier', '')} "
+                                                                                f"risk x{_risk_mult} -> {lot_size} lots"
+                                                                            )
+
                                                                         # --- Module 4: three-way entry selection -------------------------
                                                                         # TIER_1 (sweep + KOD)          -> MARKET order on the KOD candle close
+                                                                        # TIER_3 (full confluence)      -> MARKET order (KOD confirmed by definition)
                                                                         # TIER_2 (HTF + FVG/CE)         -> LIMIT order at the FVG 50% CE
                                                                         # Fallback for a TIER_2 setup with no usable CE is a sniper limit a
                                                                         # couple of pips inside the candle body, which is the previous
@@ -741,7 +799,7 @@ class Command(BaseCommand):
                                                                             except Exception as _ce_err:
                                                                                 logger.warning("FVG CE calculation failed for %s: %s", sym, _ce_err)
                                                                         
-                                                                        if _exec_tier == "TIER_1":
+                                                                        if _exec_tier in ("TIER_1", "TIER_3"):
                                                                             _order_type = "MARKET"
                                                                             _entry_label = "MARKET on KOD close"
                                                                             exec_price = round(Decimal(str(mt5_tick.ask if sig.direction == "BUY" else mt5_tick.bid)), digits)
@@ -784,7 +842,40 @@ class Command(BaseCommand):
                                                                             expiration=exp_ts,
                                                                             is_pit_open=eat_status.is_pit_open
                                                                         )
+                                                                        # --- Shadow mode (Module 8) ------------------------------
+                                                                        # When SHADOW_MODE is on, everything up to this point runs
+                                                                        # for real -- scoring, gating, sizing, price/SL/TP
+                                                                        # construction -- but no order is transmitted. This proves
+                                                                        # out the full funnel against live market data before any
+                                                                        # capital is committed.
+                                                                        if SHADOW_MODE:
+                                                                            logger.info(
+                                                                                "SHADOW-TRADE %s %s | %s | %s | lots=%s risk_mult=%s | "
+                                                                                "entry=%s sl=%s tp=%s | score=%s tier=%s | spread=%.2f pips | "
+                                                                                "gate=%s | WOULD SEND (no order transmitted)",
+                                                                                sym, tf_enum.value, sig.direction, _entry_label,
+                                                                                lot_size, _risk_mult, exec_price, exec_sl, exec_tp,
+                                                                                score.total, _exec_tier, float(spread_pips), gate_msg,
+                                                                            )
+                                                                            self.stdout.write(
+                                                                                f"SHADOW-TRADE [{sym} {tf_enum.value}] {sig.direction} "
+                                                                                f"{_exec_tier} {_entry_label}: {lot_size} lots @ {exec_price} "
+                                                                                f"SL={exec_sl} TP={exec_tp} (score {score.total}) "
+                                                                                f"-- suppressed, SHADOW_MODE=1"
+                                                                            )
+                                                                            Signal.objects.filter(id=sig.id).update(status="SHADOW_WOULD_EXECUTE")
+                                                                            continue
+
+                                                                        _send_started = time.perf_counter()
                                                                         order_res = client.place_order(req)
+                                                                        _send_ms = (time.perf_counter() - _send_started) * 1000.0
+                                                                        logger.info(
+                                                                            "BROKER-RESPONSE %s | retcode=%s comment=%s order=%s deal=%s "
+                                                                            "attempts=%s latency=%.0fms",
+                                                                            sym, order_res.get("retcode"), order_res.get("comment"),
+                                                                            order_res.get("order"), order_res.get("deal"),
+                                                                            order_res.get("attempts"), _send_ms,
+                                                                        )
 
                                                                         if order_res.get("retcode") in (10008, 10009):
                                                                             ticket_str = str(order_res.get("deal") or order_res.get("order") or "")

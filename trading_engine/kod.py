@@ -18,7 +18,29 @@ def _env_decimal(name: str, default: str) -> Decimal:
 
 
 class KODEngine:
-    """Killzone Opposing Displacement confirmation (v2.3).
+    """Killzone Opposing Displacement confirmation (v2.4).
+
+    The pattern is a **two-candle sequence**, and v2.4 corrects the fact that
+    the previous implementation tried to find it in a single candle:
+
+        candle N   -- the sweep: pierces the liquidity pool and closes back
+                      inside it. Wick-dominant by definition.
+        candle N+1 -- the displacement: drives away from the pool with
+                      conviction. Body-dominant by definition.
+
+    v2.3 evaluated every filter against ``completed[-1]`` and demanded that one
+    candle be *both* body-dominant (``body/range >= 0.55``) and wick-dominant
+    (``rejection_wick/range >= 0.30``). Because
+    ``body + upper_wick + lower_wick == range``, satisfying both forces the
+    opposite wick below 0.15 -- and when the sweep landed on the last candle,
+    ``completed[-1]`` *was* the wick-dominant sweep candle, so the body test
+    could essentially never pass. KOD confirmed on 0.35% of evaluations and
+    Tier 1 / Tier 3 never fired once in production.
+
+    v2.4 measures the rejection wick on the sweep candle and the body,
+    displacement and velocity on the following candle, so the thresholds are no
+    longer mutually exclusive. The threshold *values* are unchanged: this is a
+    correctness fix, not a loosening of the quality bar.
 
     Module 3 dynamic volatility / momentum filters:
 
@@ -88,9 +110,53 @@ class KODEngine:
         if len(completed) < 21:
             return False, f"insufficient history ({len(completed)} < 21 candles)"
 
-        c = completed[-1]
+        # --- Locate the two candles this pattern is actually made of ----------
+        # The sweep candle rejects the liquidity pool (long wick, small body).
+        # The *displacement* candle is the one that follows it and drives away
+        # from the pool (long body, small wicks). Those are opposite shapes, so
+        # they must be measured on different candles.
+        sweep_idx = int(liquidity_event.candle_index)
+        if not 0 <= sweep_idx < len(completed):
+            return False, f"sweep index {sweep_idx} outside candle window"
+
+        sweep_candle = completed[sweep_idx]
+        if sweep_idx >= len(completed) - 1:
+            # detect_sweep looks back three candles, so this resolves by itself
+            # on the next cycle once the following candle completes.
+            return False, "awaiting displacement candle after sweep"
+
+        c = completed[sweep_idx + 1]
         if c.range() <= 0:
             return False, "zero-range candle"
+        if sweep_candle.range() <= 0:
+            return False, "zero-range sweep candle"
+
+        # --- Rejection wick: measured on the SWEEP candle ---------------------
+        # This is where the rejection physically happens. Requiring it on the
+        # displacement candle (the previous behaviour) was self-defeating: a
+        # candle cannot simultaneously satisfy body/range >= 0.55 and
+        # wick/range >= 0.30 without squeezing the opposite wick under 0.15,
+        # and the sweep candle it was often applied to is by definition
+        # wick-dominant. That contradiction is why KOD confirmed on 0.35% of
+        # evaluations and Tier 1 / Tier 3 never fired even once.
+        if liquidity_event.direction == Direction.BUY:
+            sweep_wick_ratio = sweep_candle.lower_wick() / sweep_candle.range()
+        elif liquidity_event.direction == Direction.SELL:
+            sweep_wick_ratio = sweep_candle.upper_wick() / sweep_candle.range()
+        else:
+            return False, "neutral sweep direction"
+
+        if sweep_wick_ratio < self.min_rejection_ratio:
+            return False, (
+                f"sweep rejection wick {sweep_wick_ratio:.3f} < {self.min_rejection_ratio}"
+            )
+
+        # --- Displacement candle must travel with the trade -------------------
+        if c.direction() != liquidity_event.direction:
+            return False, (
+                f"displacement candle direction opposes "
+                f"{liquidity_event.direction.value} sweep"
+            )
 
         # --- Dynamic displacement filter: body >= multiplier x ATR(14) --------
         if atr_14 > 0:
@@ -102,37 +168,27 @@ class KODEngine:
                 )
 
         # --- Velocity filter: tick volume >= multiplier x MA(20) --------------
-        avg_vol_20 = sum(x.volume for x in completed[-21:-1]) / Decimal("20")
-        if avg_vol_20 > 0:
-            required_vol = self.volume_multiplier * avg_vol_20
-            if c.volume < required_vol:
-                return False, (
-                    f"velocity too low: volume {c.volume} < "
-                    f"{self.volume_multiplier}x MA20 ({required_vol})"
-                )
+        # Averaged over the 20 candles preceding the displacement candle.
+        window = completed[max(0, sweep_idx + 1 - 20):sweep_idx + 1]
+        if window:
+            avg_vol_20 = sum(x.volume for x in window) / Decimal(str(len(window)))
+            if avg_vol_20 > 0:
+                required_vol = self.volume_multiplier * avg_vol_20
+                if c.volume < required_vol:
+                    return False, (
+                        f"velocity too low: volume {c.volume} < "
+                        f"{self.volume_multiplier}x MA20 ({required_vol})"
+                    )
 
-        # --- Body ratio & directional rejection wick --------------------------
+        # --- Conviction: displacement candle must be body-dominant ------------
         body_ratio = c.body() / c.range()
         if body_ratio < self.min_body_ratio:
             return False, f"body ratio {body_ratio:.3f} < {self.min_body_ratio}"
 
-        if liquidity_event.direction == Direction.BUY:
-            if c.direction() != Direction.BUY:
-                return False, "candle direction opposes BUY sweep"
-            wick_ratio = c.lower_wick() / c.range()
-            if wick_ratio < self.min_rejection_ratio:
-                return False, f"lower wick {wick_ratio:.3f} < {self.min_rejection_ratio}"
-            return True, "KOD confirmed (BUY displacement)"
-
-        if liquidity_event.direction == Direction.SELL:
-            if c.direction() != Direction.SELL:
-                return False, "candle direction opposes SELL sweep"
-            wick_ratio = c.upper_wick() / c.range()
-            if wick_ratio < self.min_rejection_ratio:
-                return False, f"upper wick {wick_ratio:.3f} < {self.min_rejection_ratio}"
-            return True, "KOD confirmed (SELL displacement)"
-
-        return False, "neutral sweep direction"
+        return True, (
+            f"KOD confirmed ({liquidity_event.direction.value} displacement; "
+            f"sweep wick {sweep_wick_ratio:.2f}, body ratio {body_ratio:.2f})"
+        )
 
     def confirm_turtle_soup_plus_one(
         self,

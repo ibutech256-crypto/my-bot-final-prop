@@ -102,8 +102,15 @@ class LiquidityEvent:
     swept_level: Decimal
     kind: str
     candle_index: int
+    # True when the sweep was *invalidated* -- a later completed candle closed
+    # beyond ``swept_level``, meaning the market accepted the breakout rather
+    # than reversing. See trading_engine.liquidity for the full rationale.
     failed: bool
     description: str
+    # Strength of the rejection on the sweep candle, in [0, 1]. Telemetry only:
+    # nothing gates on it. Defaulted so existing 6-arg positional constructions
+    # keep working unchanged.
+    rejection_ratio: Decimal = Decimal("0")
 
 @dataclass(frozen=True)
 class StructureState:
@@ -149,6 +156,10 @@ class ScoreBreakdown:
     tier: str = ""
     # Human-readable explanation of the gating decision, for the EXEC-AUDIT log.
     gate_reason: str = ""
+    # Position-size multiplier applied to the base risk unit for this tier
+    # (Tier 1 = 0.5, Tier 2 = 1.0, Tier 3 = 1.5); 0 when the setup did not pass.
+    # Defaulted so existing positional constructions keep working unchanged.
+    risk_multiplier: Decimal = Decimal("1.0")
 
 @dataclass(frozen=True)
 class PositionSize:

@@ -1,227 +1,196 @@
-"""Position Management Daemon - manages open trades every 1 second."""
-import os, sys, time, json
-from decimal import Decimal, ROUND_DOWN
-from datetime import datetime, timezone
+"""Position synchronisation daemon.
+
+v2.4 — Module 1 (IPC stability) + Module 9 (race conditions / dead code)
+------------------------------------------------------------------------
+This runs as a ``threading.Thread(daemon=True)`` started by
+``run_mt5_engine.Command.handle``, i.e. **inside the same OS process** as the
+main strategy loop and the ScaleOutEngine.
+
+Two defects made that arrangement actively harmful:
+
+1. ``mt5.shutdown()`` on every cycle — the IPC race
+   ``run_once()`` ended with ``mt5.shutdown()`` and began with
+   ``connect_mt5()``, which called ``mt5.initialize()`` + ``mt5.login()``.
+   The ``MetaTrader5`` extension module keeps **one process-wide IPC channel**,
+   so this thread tore down and re-established the very connection the main
+   loop and ScaleOutEngine were using — once per second, forever. Any call
+   made by another thread inside that window failed with
+   ``(-10004, 'No IPC connection')``. That is the true origin of the
+   intermittent -10004 errors; it is a same-process thread race, not Windows
+   Session 0 isolation and not duplicate service instances. This daemon no
+   longer initialises or shuts down the terminal link: it verifies the shared
+   session and otherwise leaves it strictly alone.
+
+2. Competing trade management
+   ``ScaleOutEngine`` already performs the 50% partial close and the
+   stop-to-breakeven shift, and every order is submitted to the broker with a
+   real ``take_profit``, so MT5 closes the position at target server-side.
+   This daemon independently attempted its own partial close at 1R and its own
+   full close at 2R against the same tickets, so both components could act on
+   one position in the same second and double-close it. Broker-side actions
+   are removed here; ScaleOutEngine is the single owner of trade management.
+
+Removed dead code
+-----------------
+``check_tp1`` and ``check_tp2`` were never reachable — ``run_once`` called
+``execute_partial_close`` / ``close_full_position`` directly. ``check_tp1``
+also referenced an undefined ``entry_price`` (its parameter is named ``entry``),
+so it would have raised ``NameError`` the moment it was wired up, and it moved
+the stop to breakeven *without ever testing whether TP1 had been reached* —
+which on a 0.01-lot account (the common case here) meant every position would
+have been strangled at entry. Both methods are deleted rather than repaired,
+because their responsibility now belongs to ScaleOutEngine.
+
+This daemon's remaining job is exactly one thing: keep the Django ``OpenPosition``
+rows faithful to MT5, which is what the dashboard and API read from.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import time
+from decimal import Decimal
+
 import MetaTrader5 as mt5
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "backend.config.settings")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import django; django.setup()
-from django.utils import timezone as dj_tz
-from backend.apps.trading.models import OpenPosition, TradingAccount, TradingSymbol, Signal, Order
+import django  # noqa: E402
+
+django.setup()
+
+from backend.apps.trading.models import OpenPosition  # noqa: E402
+
+logger = logging.getLogger("trading")
+
+# Seconds between synchronisation passes.
+SYNC_INTERVAL_SECONDS = float(os.getenv("POSITION_SYNC_INTERVAL", "1.0"))
+# Backoff applied after an unexpected error so a persistent fault cannot spin.
+ERROR_BACKOFF_SECONDS = float(os.getenv("POSITION_SYNC_ERROR_BACKOFF", "5.0"))
+
 
 class PositionManager:
-    def __init__(self):
+    """Keeps ``OpenPosition`` rows in sync with the live MT5 terminal."""
+
+    def __init__(self) -> None:
         self.running = False
-        self.last_check = {}
-    
-    def connect_mt5(self):
-        login = int(os.getenv("MT5_LOGIN", "436005794"))
-        password = os.getenv("MT5_PASSWORD", "1234#Dt@")
-        server = os.getenv("MT5_SERVER", "Exness-MT5Trial9")
-        if not mt5.initialize():
+        self.last_check: dict[str, float] = {}
+        self.sync_count = 0
+
+    # ------------------------------------------------------------------ #
+    # Connection
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def mt5_session_ready() -> bool:
+        """Report whether the shared, process-wide MT5 session is usable.
+
+        Deliberately read-only. The owner of the connection lifecycle is
+        ``MT5Client`` in the main thread; initialising or shutting down from
+        here is what caused the -10004 race described in the module docstring.
+        """
+        try:
+            return mt5.terminal_info() is not None and mt5.account_info() is not None
+        except Exception:
             return False
-        if not mt5.login(login, password, server):
-            mt5.shutdown()
-            return False
-        return True
-    
-    def check_tp1(self, pos, entry, sl, tp1, tp2, tp3, direction):
-        """Check if TP1 (1:1) has been hit - close 50%, move SL to breakeven."""
-        current = pos.price_current
-        # Lot size guard: if 0.01, skip partial close (prevents MT5 Invalid Volume)
-        if pos.volume < 0.02:
-            # Too small to partially close - just move SL to breakeven
-            sl_mod = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "symbol": pos.symbol,
-                "position": pos.ticket,
-                "sl": float(entry_price),
-                "tp": pos.tp,
-            }
-            result = mt5.order_send(sl_mod)
-            # Update DB
-            db_pos = OpenPosition.objects.filter(broker_ticket=str(pos.ticket)).first()
-            if db_pos:
-                db_pos.stop_loss = Decimal(str(entry_price))
-                db_pos.save()
-                if db_pos.order and db_pos.order.signal:
-                    db_pos.order.signal.status = "PROTECTED"
-                    db_pos.order.signal.save()
-            return True
-        
-        # Normal case: execute partial close (lot >= 0.02)
-        if direction == "BUY" and current >= float(tp1):
-            return self.execute_partial_close(pos, 0.5, entry)
-        elif direction == "SELL" and current <= float(tp1):
-            return self.execute_partial_close(pos, 0.5, entry)
-        return False
-    
-    def execute_partial_close(self, pos, fraction, entry_price):
-        """Close a fraction of position, move SL to breakeven."""
-        close_vol = round(pos.volume * fraction, 2)
-        if close_vol < 0.01:
-            return False
-        
-        is_buy = pos.type == 0
-        tick = mt5.symbol_info_tick(pos.symbol)
-        if not tick:
-            return False
-        
-        close_price = tick.bid if is_buy else tick.ask
-        close_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
-        
-        req = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": pos.symbol,
-            "volume": close_vol,
-            "type": close_type,
-            "position": pos.ticket,
-            "price": float(close_price),
-            "deviation": 20,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        result = mt5.order_send(req)
-        if result and result.retcode in (10008, 10009):
-            remaining = pos.volume - close_vol
-            if remaining >= 0.01:
-                sl_mod = {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "symbol": pos.symbol,
-                    "position": pos.ticket,
-                    "sl": float(entry_price),
-                    "tp": pos.tp,
-                }
-                mt5.order_send(sl_mod)
-            
-            # Update DB
-            db_pos = OpenPosition.objects.filter(broker_ticket=str(pos.ticket)).first()
-            if db_pos:
-                db_pos.volume = Decimal(str(remaining))
-                if fraction >= 0.5:
-                    db_pos.stop_loss = Decimal(str(entry_price))
-                db_pos.save()
-                
-                # Update signal
-                if db_pos.order and db_pos.order.signal:
-                    db_pos.order.signal.status = "PROTECTED" if fraction >= 0.5 else "PARTIAL_TP1"
-                    db_pos.order.signal.save()
-            return True
-        return False
-    
-    def check_tp2(self, pos, entry, tp2):
-        """Check if TP2 has been hit - close remaining."""
-        current = pos.price_current
-        direction = "BUY" if pos.type == 0 else "SELL"
-        if direction == "BUY" and current >= float(tp2):
-            return self.close_full_position(pos)
-        elif direction == "SELL" and current <= float(tp2):
-            return self.close_full_position(pos)
-        return False
-    
-    def close_full_position(self, pos):
-        is_buy = pos.type == 0
-        tick = mt5.symbol_info_tick(pos.symbol)
-        if not tick: return False
-        close_price = tick.bid if is_buy else tick.ask
-        close_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
-        req = {
-            "action": mt5.TRADE_ACTION_DEAL, "symbol": pos.symbol,
-            "volume": pos.volume, "type": close_type, "position": pos.ticket,
-            "price": float(close_price), "deviation": 20,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        result = mt5.order_send(req)
-        if result and result.retcode in (10008, 10009):
-            db_pos = OpenPosition.objects.filter(broker_ticket=str(pos.ticket)).first()
-            if db_pos and db_pos.order and db_pos.order.signal:
-                db_pos.order.signal.status = "CLOSED_TP"
-                db_pos.order.signal.save()
-            if db_pos:
-                db_pos.is_deleted = True
-                db_pos.save()
-            return True
-        return False
-    
-    def check_sl_hit(self, pos):
-        """Check if SL hit - update status."""
-        # MT5 closes positions automatically on SL hit
-        # We just need to sync the status
-        db_pos = OpenPosition.objects.filter(broker_ticket=str(pos.ticket)).first()
-        if not db_pos:
+
+    # ------------------------------------------------------------------ #
+    # Synchronisation
+    # ------------------------------------------------------------------ #
+
+    def mark_closed(self, db_pos: OpenPosition, status: str) -> None:
+        """Flag a DB position as closed and propagate status to its signal.
+
+        Previously invoked as ``self.check_sl_hit(None)``, whose body
+        immediately dereferenced ``pos.ticket`` and raised
+        ``AttributeError: 'NoneType' object has no attribute 'ticket'``. That
+        fired every time a position disappeared from MT5 — i.e. on every single
+        close — and aborted the rest of the synchronisation pass, leaving stale
+        rows on the dashboard.
+        """
+        if db_pos is None:
             return
-        if db_pos.order and db_pos.order.signal:
-            db_pos.order.signal.status = "CLOSED_SL"
-            db_pos.order.signal.save()
+        try:
+            if db_pos.order and db_pos.order.signal:
+                db_pos.order.signal.status = status
+                db_pos.order.signal.save(update_fields=["status"])
+        except Exception as exc:
+            logger.warning("Could not update signal status for %s: %s",
+                           db_pos.broker_ticket, exc)
         db_pos.is_deleted = True
-        db_pos.save()
-    
-    def run_once(self):
-        """Single check cycle."""
-        if not self.connect_mt5():
+        db_pos.save(update_fields=["is_deleted"])
+
+    def run_once(self) -> None:
+        """One synchronisation pass. Never mutates the broker."""
+        if not self.mt5_session_ready():
+            # The main thread owns reconnection; just skip this pass.
             return
-        positions = mt5.positions_get() or []
-        db_positions = OpenPosition.objects.filter(is_deleted=False)
-        db_tickets = set(p.broker_ticket for p in db_positions)
-        mt5_tickets = set(str(p.ticket) for p in positions)
-        
-        # Remove stale DB positions
+
+        positions = mt5.positions_get()
+        if positions is None:
+            logger.debug("positions_get() returned None: %s", mt5.last_error())
+            return
+
+        live_by_ticket = {str(p.ticket): p for p in positions}
+        db_positions = list(OpenPosition.objects.filter(is_deleted=False))
+
+        # --- Retire DB rows whose broker position no longer exists ---------
         for dbp in db_positions:
-            if dbp.broker_ticket not in mt5_tickets:
-                self.check_sl_hit(None)
-                dbp.is_deleted = True
-                dbp.save()
-        
-        # Check each position for TP targets
-        for pos in positions:
-            ticket = str(pos.ticket)
-            dbp = OpenPosition.objects.filter(broker_ticket=ticket).first()
-            if not dbp:
+            if dbp.broker_ticket in live_by_ticket:
                 continue
-            
-            dbp.current_price = Decimal(str(pos.price_current))
-            dbp.unrealized_profit = Decimal(str(pos.profit))
-            dbp.save()
-            
-            if not dbp.order or not dbp.order.signal:
+            # Distinguish a stop-out from a target hit where we can: if the
+            # last known price sat on the losing side of entry, call it SL.
+            status = "CLOSED_SL"
+            try:
+                if dbp.entry_price is not None and dbp.current_price is not None:
+                    gained = (dbp.current_price - dbp.entry_price
+                              if str(dbp.direction).upper().endswith("BUY")
+                              else dbp.entry_price - dbp.current_price)
+                    status = "CLOSED_TP" if gained > 0 else "CLOSED_SL"
+            except Exception:
+                pass
+            self.mark_closed(dbp, status)
+
+        # --- Refresh live rows ---------------------------------------------
+        for dbp in db_positions:
+            pos = live_by_ticket.get(dbp.broker_ticket)
+            if pos is None:
                 continue
-                
-            sig = dbp.order.signal
-            entry = float(dbp.entry_price)
-            sl = float(dbp.stop_loss)
-            tp1 = entry + abs(entry - sl) * 1.0 if dbp.direction == "BUY" else entry - abs(entry - sl) * 1.0
-            tp2 = entry + abs(entry - sl) * 2.0 if dbp.direction == "BUY" else entry - abs(entry - sl) * 2.0
-            direction = dbp.direction
-            
-            if sig.status not in ["PROTECTED", "RUNNER", "CLOSED_TP", "CLOSED_SL"]:
-                # Check TP1
-                hit_tp1 = (direction == "BUY" and pos.price_current >= tp1) or                           (direction == "SELL" and pos.price_current <= tp1)
-                if hit_tp1 and sig.status != "PARTIAL_TP1":
-                    if self.execute_partial_close(pos, 0.5, entry):
-                        sig.status = "PROTECTED"
-                        sig.save()
-                        continue
-                
-                # Check TP2
-                hit_tp2 = (direction == "BUY" and pos.price_current >= tp2) or                           (direction == "SELL" and pos.price_current <= tp2)
-                if hit_tp2:
-                    if self.close_full_position(pos):
-                        continue
-        
-        mt5.shutdown()
-    
-    def run_loop(self):
+            try:
+                dbp.current_price = Decimal(str(pos.price_current))
+                dbp.unrealized_profit = Decimal(str(pos.profit))
+                dbp.volume = Decimal(str(pos.volume))
+                # Reflect broker-side SL moves (ScaleOutEngine breakeven shifts)
+                # so the dashboard does not display a stale stop.
+                if pos.sl:
+                    dbp.stop_loss = Decimal(str(pos.sl))
+                if pos.tp:
+                    dbp.take_profit = Decimal(str(pos.tp))
+                dbp.save(update_fields=[
+                    "current_price", "unrealized_profit", "volume",
+                    "stop_loss", "take_profit",
+                ])
+            except Exception as exc:
+                logger.warning("Position sync failed for ticket %s: %s",
+                               dbp.broker_ticket, exc)
+
+        self.sync_count += 1
+
+    def run_loop(self) -> None:
         self.running = True
         while self.running:
             try:
                 self.run_once()
-                time.sleep(1)
+                time.sleep(SYNC_INTERVAL_SECONDS)
             except KeyboardInterrupt:
                 self.running = False
-            except Exception as e:
-                time.sleep(5)
+            except Exception as exc:
+                logger.exception("PositionManager sync error: %s", exc)
+                time.sleep(ERROR_BACKOFF_SECONDS)
+
 
 if __name__ == "__main__":
-    pm = PositionManager()
-    pm.run_loop()
+    PositionManager().run_loop()
