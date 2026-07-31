@@ -4,13 +4,14 @@
 
 import React, { useEffect, useState, useRef, useCallback } from "react";
 import { API_BASE_URL } from "../lib/api";
+import FunnelPanel, { FunnelPush } from "./FunnelPanel";
 import {
   LayoutDashboard, Activity, CandlestickChart, Briefcase, BarChart3,
   ShieldAlert, Terminal, Brain, Globe, BookOpen, Settings,
   TrendingUp, TrendingDown, DollarSign, LineChart, PieChart,
   AlertTriangle, Zap, RefreshCw, Play, Pause, X, Search,
   CheckCircle, XCircle, AlertCircle, ArrowUp, ArrowDown,
-  Clock, ExternalLink, Maximize2, Minimize2, ChevronRight
+  Clock, ExternalLink, Maximize2, Minimize2, ChevronRight, Filter
 } from "lucide-react";
 
 // ============================================================
@@ -18,7 +19,9 @@ import {
 // ============================================================
 interface AccountSnapshot { id: string; account_number: string; account_name: string; currency: string; balance: number; equity: number; margin: number; leverage: number; is_active: boolean; }
 interface SignalItem { id: string; symbol: any; symbol_name?: string; strategy_name: string; direction: string; status: string; entry_price: string | number; stop_loss: string | number; take_profit: string | number; confidence: string | number; rationale: string; created_at?: string; }
-interface OpenPositionItem { id: string; symbol: any; symbol_name?: string; direction: string; volume: string | number; entry_price: string | number; current_price: string | number; unrealized_profit: string | number; broker_ticket: string; opened_at?: string; }
+// stop_loss / take_profit are nullable on the model and the serializer uses
+// fields="__all__", so they are always present in the payload but may be null.
+interface OpenPositionItem { id: string; symbol: any; symbol_name?: string; direction: string; volume: string | number; entry_price: string | number; current_price: string | number; stop_loss?: string | number | null; take_profit?: string | number | null; unrealized_profit: string | number; broker_ticket: string; opened_at?: string; }
 interface TelemetryItem { timestamp: string; symbol: string; stage: string; status: string; message: string; details: string; severity: string; }
 
 // ============================================================
@@ -31,6 +34,7 @@ const pct = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
 const NAV = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "signals", label: "Signals", icon: Activity },
+  { id: "funnel", label: "Signal Funnel", icon: Filter },
   { id: "charts", label: "Charts", icon: CandlestickChart },
   { id: "positions", label: "Positions", icon: Briefcase },
   { id: "analytics", label: "Analytics", icon: BarChart3 },
@@ -49,6 +53,8 @@ export default function ClientDashboard() {
   const [positions, setPositions] = useState<OpenPositionItem[]>([]);
   const [closedTrades, setClosedTrades] = useState<any[]>([]);
   const [telemetry, setTelemetry] = useState<TelemetryItem[]>([]);
+  // Pushed by run_mt5_engine every FUNNEL_REPORT_EVERY_CYCLES scan cycles.
+  const [funnel, setFunnel] = useState<FunnelPush | null>(null);
   const [wsStatus, setWsStatus] = useState("Connecting...");
   const [lastUpdated, setLastUpdated] = useState(new Date().toLocaleTimeString());
   // Stale-data detection: record when telemetry actually last arrived.
@@ -103,6 +109,7 @@ export default function ClientDashboard() {
           if (d.event === "ACCOUNT_TELEMETRY" && d.account) setAccount(p => ({ ...(p || { id:"1", account_name:"Exness MT5", currency:"USD", leverage:100, is_active:true }), account_number: d.account?.account_number ?? p?.account_number ?? "", balance: safeNum(d.account?.balance ?? p?.balance), equity: safeNum(d.account?.equity ?? p?.equity), margin: safeNum(d.account?.margin ?? p?.margin) }));
           if (d.event === "POSITIONS_SYNC" && Array.isArray(d.positions)) setPositions(d.positions);
           if (d.event === "NEW_SIGNAL" && d.signal) setSignals(p => { const u = [d.signal, ...(p || [])]; try { u.sort((a:any,b:any) => safeNum(b.confidence) - safeNum(a.confidence)); } catch {} return u; });
+          if (d.event === "FUNNEL_UPDATE" && d.funnel) setFunnel(d.funnel);
           if (d.event === "TELEMETRY" && d.telemetry) {
             telemetryBuffer.current = [...telemetryBuffer.current, d.telemetry].slice(-500);
             if (!telemetryPaused) setTelemetry([...telemetryBuffer.current]);
@@ -545,6 +552,7 @@ export default function ClientDashboard() {
         <section className="flex-1 p-4 overflow-auto max-h-[calc(100vh-3rem)] overflow-y-auto">
           {activeTab === "dashboard" && renderDashboard()}
           {activeTab === "signals" && renderSignals()}
+          {activeTab === "funnel" && <FunnelPanel pushed={funnel} />}
           {activeTab === "charts" && renderCharts()}
           {activeTab === "positions" && renderPositions()}
           {activeTab === "analytics" && renderAnalytics()}

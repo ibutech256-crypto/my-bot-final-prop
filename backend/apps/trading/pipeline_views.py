@@ -36,7 +36,6 @@ from django.conf import settings
 from django.db.models import Avg, Count
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -70,9 +69,17 @@ def _snapshot_path() -> Path:
 
 
 class FunnelView(APIView):
-    """Latest signal-lifecycle funnel snapshot written by the engine."""
+    """Latest signal-lifecycle funnel snapshot written by the engine.
 
-    permission_classes = [IsAuthenticated]
+    Permissions match the rest of this API surface (``ReadOnlyOrPrivileged``:
+    reads open, writes privileged), because the existing dashboard fetches
+    every endpoint unauthenticated. That posture is a pre-existing security
+    finding recorded in the remediation report, not a decision taken here --
+    tightening it must be done for all endpoints at once or the dashboard
+    breaks.
+    """
+
+    permission_classes = [ReadOnlyOrPrivileged]
 
     def get(self, request):
         path = _snapshot_path()
@@ -125,7 +132,7 @@ class FunnelWatchlistView(APIView):
     them so the dominant blocker is visible at a glance.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [ReadOnlyOrPrivileged]
 
     def get(self, request):
         try:
