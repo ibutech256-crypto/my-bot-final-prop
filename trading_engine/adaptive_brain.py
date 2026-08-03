@@ -128,7 +128,8 @@ class AdaptiveBrainGate:
         is_live_trade: bool = True,
         adx_at_entry: Decimal = Decimal("28.0"),
         atr_at_entry: Decimal = Decimal("0.020"),
-        score_at_entry: Decimal = Decimal("88.00")
+        score_at_entry: Decimal = Decimal("88.00"),
+        broker_ticket: str | None = None,
     ) -> Dict[str, Any]:
         """
         AI Forensic Outcome Analyzer for Hit TP / Hit SL events.
@@ -210,18 +211,33 @@ class AdaptiveBrainGate:
                 acc = TradingAccount.objects.filter(is_active=True, is_deleted=False).first()
                 sym_obj, _ = TradingSymbol.objects.get_or_create(symbol=symbol)
                 if acc and sym_obj and admin:
-                    ct = ClosedTrade.objects.create(
-                        account=acc,
-                        symbol=sym_obj,
-                        direction=direction,
-                        volume=Decimal("0.10"),
-                        entry_price=entry_price,
-                        exit_price=exit_price,
-                        profit=profit_usd,
-                        opened_at=django_tz.now() - timedelta(minutes=30),
-                        closed_at=django_tz.now(),
-                        broker_ticket=str(int(datetime.now().timestamp()))
+                    # Use the REAL broker deal ticket when supplied. Previously this
+                    # was a timestamp, so every duplicate write got a fresh unique
+                    # ticket and no dedup was possible. get_or_create makes the
+                    # forensic record idempotent per deal.
+                    _tkt = str(broker_ticket) if broker_ticket else str(int(datetime.now().timestamp()))
+                    ct, _created = ClosedTrade.objects.get_or_create(
+                        broker_ticket=_tkt,
+                        defaults=dict(
+                            account=acc,
+                            symbol=sym_obj,
+                            direction=direction,
+                            volume=Decimal("0.10"),
+                            entry_price=entry_price,
+                            exit_price=exit_price,
+                            profit=profit_usd,
+                            opened_at=django_tz.now() - timedelta(minutes=30),
+                            closed_at=django_tz.now(),
+                        ),
                     )
+                    if not _created:
+                        return {
+                            "is_win": is_win,
+                            "diagnosis": diagnosis,
+                            "consecutive_losses": mem.consecutive_losses,
+                            "sizing_multiplier": float(mem.sizing_multiplier),
+                            "is_quarantined": mem.sizing_multiplier == Decimal("0.00"),
+                        }
                     TradeJournal.objects.create(
                         trade=ct,
                         user=admin,

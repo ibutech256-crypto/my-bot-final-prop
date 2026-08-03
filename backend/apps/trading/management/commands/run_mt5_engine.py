@@ -17,7 +17,7 @@ from channels.layers import get_channel_layer
 
 from broker_engine.mt5_client import MT5Client, BrokerOrderRequest
 from backend.apps.trading.models import (
-    BrokerProfile, BrokerSetting, TradingAccount, TradingSymbol, Signal, OpenPosition, Order, SignalDirection
+    BrokerProfile, BrokerSetting, TradingAccount, TradingSymbol, Signal, OpenPosition, Order, SignalDirection, ClosedTrade
 )
 from backend.apps.notifications.models import TelegramSubscriber
 from trading_engine.orchestrator import RomeoTPTOrchestrator, EngineConfig
@@ -641,7 +641,17 @@ class Command(BaseCommand):
                     for deal in recent_deals:
                         if deal.profit != 0.0 and deal.entry == 1:  # DEAL_ENTRY_OUT / INOUT
                             d_ticket = str(deal.ticket)
-                            deal_audited = Signal.objects.filter(symbol__symbol=deal.symbol, rationale__icontains=d_ticket).exists()
+                            # FIX: the previous dedup relied on Signal.rationale containing the deal
+                            # ticket, but that string is only written inside `if recent_sig:` below.
+                            # When no ACTIVE signal exists for the symbol the ticket was never
+                            # recorded, so the SAME closed deal was re-audited on every engine loop
+                            # (85 duplicate ClosedTrade rows + 85 Telegram "Hit SL" alerts from ONE
+                            # real -$1.10 deal, which also drove the Adaptive Brain into quarantine).
+                            # ClosedTrade.broker_ticket is authoritative and independent of signal state.
+                            deal_audited = (
+                                ClosedTrade.objects.filter(broker_ticket=d_ticket).exists()
+                                or Signal.objects.filter(symbol__symbol=deal.symbol, rationale__icontains=d_ticket).exists()
+                            )
                             if not deal_audited:
                                 is_win = deal.profit > 0.0
                                 ai_report = adaptive_brain.analyze_trade_outcome(
@@ -652,7 +662,8 @@ class Command(BaseCommand):
                                     exit_price=Decimal(str(deal.price)),
                                     sl=Decimal("0.0"),
                                     tp=Decimal("0.0"),
-                                    is_live_trade=True
+                                    is_live_trade=True,
+                                    broker_ticket=d_ticket,
                                 )
                                 recent_sig = Signal.objects.filter(symbol__symbol=deal.symbol, status="ACTIVE", is_deleted=False).order_by("-created_at").first()
                                 if recent_sig:
